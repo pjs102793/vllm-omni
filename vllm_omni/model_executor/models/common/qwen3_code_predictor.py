@@ -392,6 +392,7 @@ class CodePredictorWrapperConfig:
     use_projection: bool = False
     return_proj_buf: bool = False
     sampling_mode: str = "stored"
+    use_kv_cache: bool = False
 
 
 # ===================================================================
@@ -439,12 +440,22 @@ class CodePredictorWrapper(nn.Module):
         # Determine embedding dimension
         _talker_hidden = int(talker_hidden_size) if talker_hidden_size is not None else self._cp_hidden
 
-        self.model = CodePredictorBaseModel(
-            cp_config,
-            embedding_dim=_talker_hidden,
-            use_parallel_embedding=wrapper_config.use_parallel_embedding,
-            prefix=f"{prefix}.model" if prefix else "model",
-        )
+        if wrapper_config.use_kv_cache:
+            from vllm_omni.model_executor.models.common.qwen3_code_predictor_kv_graph import (
+                CodePredictorBaseModelKVGraph,
+            )
+
+            self.model = CodePredictorBaseModelKVGraph(
+                cp_config,
+                embedding_dim=_talker_hidden,
+            )
+        else:
+            self.model = CodePredictorBaseModel(
+                cp_config,
+                embedding_dim=_talker_hidden,
+                use_parallel_embedding=wrapper_config.use_parallel_embedding,
+                prefix=f"{prefix}.model" if prefix else "model",
+            )
 
         self.lm_head = nn.ModuleList(
             [nn.Linear(cp_config.hidden_size, cp_config.vocab_size, bias=False) for _ in range(self._num_groups - 1)]
@@ -469,6 +480,17 @@ class CodePredictorWrapper(nn.Module):
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
         self._device_graphs: dict[int, tuple] = {}  # (graph, static_output) per bucket
+
+        # KV-cache + CUDA-graph state (lazily filled by _setup_kv_graphs).
+        self._kv_states: dict[int, object] = {}
+        self._kv_prefill_in: dict[int, torch.Tensor] = {}
+        self._kv_prefill_pos: dict[int, torch.Tensor] = {}
+        self._kv_decode_in: dict[int, torch.Tensor] = {}
+        self._kv_decode_pos: dict[int, torch.Tensor] = {}
+        self._kv_prefill_graph: dict[int, tuple] = {}
+        self._kv_decode_graph: dict[int, tuple] = {}
+        self._kv_prefill_fwd = None
+        self._kv_decode_fwd = None
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
@@ -495,6 +517,117 @@ class CodePredictorWrapper(nn.Module):
             return
         self._proj_buf = torch.zeros(bsz, max_seq, self._cp_hidden, dtype=dtype, device=device)
 
+    def _setup_kv_graphs(self) -> None:
+        """KV-cache path: torch.compile prefill + decode forwards, capture one
+        prefill graph and one decode graph per batch-size bucket.
+
+        State is held in dicts keyed by bucket size; ``_forward_kv`` selects
+        the bucket via ``_padded_bsz`` and replays the matching graphs.
+        """
+        from vllm.platforms import current_platform
+
+        from vllm_omni.model_executor.models.common.qwen3_code_predictor_kv_graph import (
+            KVGraphState as _KVGraphState,
+        )
+
+        del _KVGraphState  # the type itself is unused here, just want a single import point
+
+        # Determine bucket sizes the same way the re-prefill path does.
+        max_bsz = self._vllm_config.scheduler_config.max_num_seqs
+        bucket_sizes = [1 << i for i in range(max_bsz.bit_length()) if (1 << i) <= max_bsz]
+        if max_bsz not in bucket_sizes:
+            bucket_sizes.append(max_bsz)
+        self._bucket_sizes = sorted(bucket_sizes)
+
+        device = next(self.model.parameters()).device
+        dtype = self._model_dtype
+        cp_hidden = self._cp_hidden
+
+        # Compile prefill/decode forwards. Inductor produces one graph per
+        # (shape, mode) combo; cuda-graph capture sits on top of the compiled
+        # function so we get both fusion + launch elimination.
+        if current_omni_platform.supports_torch_inductor():
+            prefill_fwd = torch.compile(
+                self.model.forward_prefill,
+                dynamic=False,
+                options={"epilogue_fusion": False},
+            )
+            decode_fwd = torch.compile(
+                self.model.forward_decode,
+                dynamic=False,
+                options={"epilogue_fusion": False},
+            )
+            compile_msg = "torch.compile(epilogue_fusion=False)"
+        else:
+            prefill_fwd = self.model.forward_prefill
+            decode_fwd = self.model.forward_decode
+            compile_msg = "eager"
+
+        self._kv_prefill_fwd = prefill_fwd
+        self._kv_decode_fwd = decode_fwd
+
+        pool = current_platform.get_global_graph_pool()
+
+        for bsz in self._bucket_sizes:
+            # Allocate per-bucket KV state + static input/pos buffers.
+            state = self.model.allocate_state(bsz, device, dtype)
+            self._kv_states[bsz] = state
+
+            pre_in = torch.zeros(bsz, 2, cp_hidden, dtype=dtype, device=device)
+            pre_pos = (
+                torch.arange(2, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1).contiguous()
+            )
+            dec_in = torch.zeros(bsz, 1, cp_hidden, dtype=dtype, device=device)
+            dec_pos = torch.zeros(bsz, 1, device=device, dtype=torch.long)
+
+            self._kv_prefill_in[bsz] = pre_in
+            self._kv_prefill_pos[bsz] = pre_pos
+            self._kv_decode_in[bsz] = dec_in
+            self._kv_decode_pos[bsz] = dec_pos
+
+            # Warmup eager + compiled forwards so Inductor compiles before capture.
+            state.reset()
+            for _ in range(3):
+                _ = prefill_fwd(pre_in, pre_pos, state.k_caches, state.v_caches)
+            torch.cuda.synchronize()
+
+            # Warmup decode (after a prefill so cache slot 0,1 are populated).
+            state.set_decode_step(2)
+            dec_pos.fill_(2)
+            for _ in range(3):
+                _ = decode_fwd(
+                    dec_in, dec_pos, state.k_caches, state.v_caches,
+                    state.write_idx, state.attn_mask,
+                )
+            torch.cuda.synchronize()
+
+            # Capture prefill graph (fresh state).
+            state.reset()
+            g_pre = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g_pre, pool=pool):
+                out_pre = prefill_fwd(pre_in, pre_pos, state.k_caches, state.v_caches)
+            self._kv_prefill_graph[bsz] = (g_pre, out_pre)
+
+            # Capture decode graph with cache_len=2 (post-prefill state).
+            state.reset()
+            state.set_decode_step(2)
+            dec_pos.fill_(2)
+            g_dec = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g_dec, pool=pool):
+                out_dec = decode_fwd(
+                    dec_in, dec_pos, state.k_caches, state.v_caches,
+                    state.write_idx, state.attn_mask,
+                )
+            self._kv_decode_graph[bsz] = (g_dec, out_dec)
+
+        # Mark "compile done" so forward() doesn't re-enter.
+        self._compiled_model_fwd = object()  # sentinel
+        logger.info(
+            "code_predictor: KV-cache + CUDA graphs captured (%s) for buckets %s",
+            compile_msg,
+            self._bucket_sizes,
+        )
+
     def _setup_compile(self) -> None:
         """Lazily set up torch.compile with optional device graph capture."""
         if self._compiled_model_fwd is not None:
@@ -506,6 +639,27 @@ class CodePredictorWrapper(nn.Module):
         self._model_dtype = next(self.model.parameters()).dtype
         self._lm_heads_list = list(self.lm_head)
         self._codec_embeds_list = list(self.model.codec_embedding)
+
+        if self._wrapper_config.use_kv_cache:
+            # bf16 by default. Sampling-mode perceptual quality (DNSMOS) is
+            # parity with re-prefill in our measurements; fp32 was only used
+            # for strict greedy equivalence experiments. Toggle to fp32 with
+            # QWEN3_TTS_KV_CACHE_FP32=1 if a deployment needs deterministic-
+            # equivalent output under greedy.
+            import os as _os
+
+            if _os.environ.get("QWEN3_TTS_KV_CACHE_FP32", "0") == "1":
+                self.model = self.model.float()
+                for i, lm in enumerate(self.lm_head):
+                    self.lm_head[i] = lm.float()
+                if isinstance(self.small_to_mtp_projection, nn.Linear):
+                    self.small_to_mtp_projection = self.small_to_mtp_projection.float()
+                self._model_dtype = torch.float32
+                logger.info("code_predictor: KV-cache mode forcing fp32 (QWEN3_TTS_KV_CACHE_FP32=1)")
+            else:
+                logger.info("code_predictor: KV-cache mode using bf16 (default)")
+            self._setup_kv_graphs()
+            return
 
         if not current_omni_platform.supports_torch_inductor():
             # NPU or other platforms without Inductor support
@@ -621,7 +775,13 @@ class CodePredictorWrapper(nn.Module):
         top_p: float = 1.0,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Predict residual codebooks 1..G-1 autoregressively via re-prefill."""
+        """Predict residual codebooks 1..G-1 autoregressively."""
+        if self._wrapper_config.use_kv_cache:
+            return self._forward_kv(
+                layer0_code, layer0_embed, last_talker_hidden,
+                do_sample, temperature, top_k, top_p, generator,
+            )
+
         bsz = int(layer0_code.shape[0])
         num_groups = self._num_groups
         device = layer0_code.device
@@ -730,6 +890,118 @@ class CodePredictorWrapper(nn.Module):
 
         if self._wrapper_config.return_proj_buf:
             return all_codes, proj_buf[:bsz].clone()
+        return all_codes
+
+    # ------------------------------------------------------------------
+    #  Forward (KV-cache variant) -- prefill(seq=2) + (Q-2) decode steps
+    # ------------------------------------------------------------------
+
+    @torch.inference_mode()
+    def _forward_kv(
+        self,
+        layer0_code: torch.Tensor,
+        layer0_embed: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        bsz = int(layer0_code.shape[0])
+        num_groups = self._num_groups
+        device = layer0_code.device
+
+        self._setup_compile()  # populates _kv_* maps on first call
+        dtype = self._model_dtype
+
+        padded_bsz = self._padded_bsz(bsz)
+        state = self._kv_states[padded_bsz]
+        pre_in = self._kv_prefill_in[padded_bsz]
+        dec_in = self._kv_decode_in[padded_bsz]
+        dec_pos = self._kv_decode_pos[padded_bsz]
+        g_pre, out_pre = self._kv_prefill_graph[padded_bsz]
+        g_dec, out_dec = self._kv_decode_graph[padded_bsz]
+
+        projection = self.small_to_mtp_projection
+        lm_heads = self._lm_heads_list
+        codec_embeds = self._codec_embeds_list
+
+        # Reset KV state for this call (cache + mask).
+        state.reset()
+
+        # Populate prefill input buffer (pre_in is a graph-captured tensor).
+        pos0 = projection(last_talker_hidden.reshape(bsz, 1, -1).to(dtype))
+        pos1 = projection(layer0_embed.reshape(bsz, 1, -1).to(dtype))
+        pre_in.zero_()
+        pre_in[:bsz, 0:1, :] = pos0
+        pre_in[:bsz, 1:2, :] = pos1
+
+        # Replay prefill graph -> hidden_out captured in out_pre.
+        g_pre.replay()
+
+        # Sampling helpers
+        stored_mode = self._wrapper_config.sampling_mode == "stored"
+        if stored_mode:
+            s_top_k = self._top_k
+            s_top_p = self._top_p
+            use_sampling = True
+            inv_temperature = 0.0
+        else:
+            use_sampling = do_sample and temperature > 0
+            inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
+            if use_sampling and top_p != 1.0:
+                raise NotImplementedError(
+                    "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
+                )
+
+        all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
+        all_codes[:, 0] = layer0_code.reshape(bsz)
+
+        def _sample(logits: torch.Tensor) -> torch.Tensor:
+            if stored_mode:
+                if s_top_k > 0:
+                    topk_vals, _ = logits.topk(s_top_k, dim=-1)
+                    logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
+                if s_top_p < 1.0:
+                    sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+                    sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
+                    cumulative_probs = sorted_probs.cumsum(dim=-1)
+                    remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
+                    sorted_logits[remove_mask] = float("-inf")
+                    logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
+                probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+                return torch.multinomial(probs, num_samples=1, generator=generator)
+            if use_sampling:
+                scaled = logits * inv_temperature
+                if top_k > 0:
+                    topk_vals, _ = scaled.topk(top_k, dim=-1)
+                    scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+                probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
+                return torch.multinomial(probs, num_samples=1, generator=generator)
+            return logits.argmax(dim=-1, keepdim=True)
+
+        # Step 1: emit logits at prefill output position 1 -> sample code 1.
+        logits = lm_heads[0](out_pre[:bsz, 1, :])
+        code = _sample(logits)
+        all_codes[:, 1] = code.reshape(bsz)
+        last_code = code
+
+        # Steps 2..G-1: decode replay with host-side write_idx / mask update.
+        for step in range(2, num_groups):
+            new_embed = codec_embeds[step - 2](last_code)  # [B, 1, emb]
+            next_in = projection(new_embed.reshape(bsz, 1, -1))
+            dec_in.zero_()
+            dec_in[:bsz, :, :] = next_in
+            dec_pos.fill_(step)
+            state.set_decode_step(step)
+            g_dec.replay()
+
+            logits = lm_heads[step - 1](out_dec[:bsz, 0, :])
+            code = _sample(logits)
+            all_codes[:, step] = code.reshape(bsz)
+            last_code = code
+
         return all_codes
 
     # ------------------------------------------------------------------

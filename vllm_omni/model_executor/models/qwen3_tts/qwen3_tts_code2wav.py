@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -44,6 +45,16 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._decode_chunk_frames = 300
         self._decode_left_context_frames = 25
         self._logged_codec_stats = False
+
+        # Diagnostic: skip the codec→waveform decode and return zeros of the
+        # correct length. Lets us measure main-talker + sub-talker throughput
+        # without C2W cost. Toggle: QWEN3_TTS_SKIP_C2W=1
+        self._skip_c2w = os.environ.get("QWEN3_TTS_SKIP_C2W", "0") == "1"
+        if self._skip_c2w:
+            logger.warning(
+                "QWEN3_TTS_SKIP_C2W=1: Code2Wav decode skipped (zero audio). "
+                "Use only for throughput diagnostics, not quality measurements."
+            )
 
         # Construct decoder from config so it is visible to vLLM's
         # memory profiler at startup.  Weights are loaded later in
@@ -189,8 +200,15 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         # Decode directly via decoder.chunked_decode(), staying entirely on GPU.
         # Each request decoded individually with CUDA graph replay at bs=1.
+        # When _skip_c2w is set, produce a zero waveform of the expected
+        # length without invoking the decoder — for throughput diagnostics.
         wav_tensors: list[torch.Tensor] = []
         for codes_qf in valid_codes_qf:
+            if self._skip_c2w:
+                wav_len = int(codes_qf.shape[1]) * upsample
+                wav = torch.zeros(wav_len, dtype=torch.float32, device=codes_qf.device)
+                wav_tensors.append(wav)
+                continue
             codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
             try:
                 wav = decoder.chunked_decode(
