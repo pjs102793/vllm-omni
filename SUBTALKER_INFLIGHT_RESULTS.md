@@ -51,6 +51,38 @@
 
 → Inflight이 KV-on PoC 대비 OVRL -2.1%. Sampling stochasticity (N=8 sample variance ≈ 0.05) 범위 내.
 
+### 추가 검증: bs=64 + C2W skip 비교
+
+higher batch에서 lever가 풀리는지 확인 — KV-on PoC bs=128+C2W skip vs Inflight bs=64+C2W skip:
+
+| | KV-on RTF agg | Inflight RTF agg | Δ |
+|---|---:|---:|---:|
+| short bs=1 | 0.150 | 0.156 | +4% |
+| short bs=64 | 0.010 | **0.023** | **+130% regression** |
+| medium bs=1 | 0.135 | 0.137 | +1% |
+| medium bs=64 | 0.007 | 0.007 | 0% |
+| long bs=1 | 0.130 | 0.133 | +2% |
+| long bs=64 | 0.008 | 0.007 | −12% |
+
+→ bs=64 short에서 inflight이 130% slower (per-token gather/mask 오버헤드가 메인 비용 dominate). medium/long은 noise 수준. **higher batch에서도 lever 없음.**
+
+### 추가 검증: Phase-mix vs lockstep kernel micro-bench
+
+scheduler integration이 풀 수 있는 phase-diversity 효과를 kernel 단에서 직접 측정 (`bench_inflight_phasemix.py`):
+
+| N tokens | inflight phasemix (μs) | inflight lockstep (μs) | KV-graph lockstep (μs) |
+|---:|---:|---:|---:|
+| 8 | 398.9 | 401.0 | 384.6 |
+| 16 | 471.8 | 472.5 | 468.8 |
+| 32 | 509.5 | 509.5 | 512.8 |
+| 64 | 547.4 | 548.6 | 575.2 |
+| 128 | 1310.2 | 1307.2 | 1259.0 |
+| 256 | 1716.7 | 1709.4 | 1647.2 |
+
+→ **Phase-mix vs lockstep: ±0.5%** (모든 N). Phase diversity 자체는 kernel time에 영향 없음. Scheduler integration을 해도 본 kernel은 더 빠르지 않음.
+
+이것은 (1)의 prerequisite을 풀어도 wall-time 개선이 없다는 정량적 확정. 본 architecture에서 wall-time lever는 phase-mix가 아니라 main+sub overlap (multi-stream) 또는 sub_step 자체 축소 (INT8 / 모델 압축).
+
 ## 왜 wall-time 개선이 없는가 — 근본 원인
 
 설계 문서 (`SUBTALKER_INFLIGHT_DESIGN.md`)에 사전 분석된 그대로:
@@ -94,7 +126,13 @@
 | **D** | Scheduler-level in-flight (이 브랜치 follow-up) | 본 분석상 negative or marginal | 작음 | 2-3주 (효과 검증 필요) |
 | **E** | Sub-talker model 압축 (layer/hidden 축소) | sub-step time −50%+ | 적당 (재학습) | 모델 변경 |
 
-D는 이 브랜치 작업을 base로 가능하지만, 사전 분석상 효과 negative. A가 가장 ROI 높음.
+D는 이 브랜치 작업을 base로 가능하지만, **phasemix micro-bench가 정량적으로 negative 확인 (±0.5%)**. A가 가장 ROI 높음.
+
+## 결론
+
+본 브랜치는 in-flight kernel + integration 자체는 정상 동작. 그러나 **요구사항 (2) "명확한 속도 개선"은 본 architecture에서 본 branch만으로 달성 불가**가 (a) bs=1~64 server bench, (b) bs=64+C2W skip 비교, (c) kernel-level phasemix micro-bench 3가지 layer로 정량 확인됨.
+
+다음 step으로 wall-time 개선을 원하면 우선순위 **A (Stage 1 C2W graph) 또는 C (multi-stream main+sub overlap)**가 본 분석에서 도출되는 유일한 lever임. D (scheduler integration)는 본 브랜치 work 위에 가능하지만 micro-bench 결과 효과 없음.
 
 ## 브랜치 / PR
 
