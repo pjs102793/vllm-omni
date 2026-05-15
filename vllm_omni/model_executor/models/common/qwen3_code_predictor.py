@@ -393,6 +393,7 @@ class CodePredictorWrapperConfig:
     return_proj_buf: bool = False
     sampling_mode: str = "stored"
     use_kv_cache: bool = False
+    use_inflight: bool = False  # token-flat per-token cache slot path
 
 
 # ===================================================================
@@ -440,7 +441,16 @@ class CodePredictorWrapper(nn.Module):
         # Determine embedding dimension
         _talker_hidden = int(talker_hidden_size) if talker_hidden_size is not None else self._cp_hidden
 
-        if wrapper_config.use_kv_cache:
+        if wrapper_config.use_inflight:
+            from vllm_omni.model_executor.models.common.qwen3_code_predictor_inflight import (
+                CodePredictorBaseModelInflight,
+            )
+
+            self.model = CodePredictorBaseModelInflight(
+                cp_config,
+                embedding_dim=_talker_hidden,
+            )
+        elif wrapper_config.use_kv_cache:
             from vllm_omni.model_executor.models.common.qwen3_code_predictor_kv_graph import (
                 CodePredictorBaseModelKVGraph,
             )
@@ -492,6 +502,12 @@ class CodePredictorWrapper(nn.Module):
         self._kv_prefill_fwd = None
         self._kv_decode_fwd = None
 
+        # In-flight (token-flat per-token cache slot) state.
+        self._inflight_state = None
+        self._inflight_in_buf: dict[int, torch.Tensor] = {}
+        self._inflight_graph: dict[int, tuple] = {}
+        self._inflight_fwd = None
+
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
 
@@ -516,6 +532,83 @@ class CodePredictorWrapper(nn.Module):
         ):
             return
         self._proj_buf = torch.zeros(bsz, max_seq, self._cp_hidden, dtype=dtype, device=device)
+
+    def _setup_inflight_graphs(self) -> None:
+        """In-flight path: one graph per bucket N captures the token-flat
+        forward. K/V cache buffers are shared across buckets (sized for
+        max_num_seqs); per-bucket buffers hold ``slot_indices``,
+        ``write_positions``, ``position_ids``, ``attn_mask`` and input.
+        Mutated host-side between replays.
+        """
+        from vllm.platforms import current_platform
+
+        max_bsz = self._vllm_config.scheduler_config.max_num_seqs
+        bucket_sizes = [1 << i for i in range(max_bsz.bit_length()) if (1 << i) <= max_bsz]
+        if max_bsz not in bucket_sizes:
+            bucket_sizes.append(max_bsz)
+        self._bucket_sizes = sorted(bucket_sizes)
+
+        device = next(self.model.parameters()).device
+        dtype = self._model_dtype
+        cp_hidden = self._cp_hidden
+
+        if current_omni_platform.supports_torch_inductor():
+            fwd = torch.compile(
+                self.model.forward,
+                dynamic=False,
+                options={"epilogue_fusion": False},
+            )
+            compile_msg = "torch.compile(epilogue_fusion=False)"
+        else:
+            fwd = self.model.forward
+            compile_msg = "eager"
+        self._inflight_fwd = fwd
+
+        # Shared K/V cache state (sized to max bucket).
+        max_state = self.model.allocate_state(max(self._bucket_sizes), device, dtype)
+        self._inflight_state = max_state
+        max_seq = max_state.max_seq
+
+        pool = current_platform.get_global_graph_pool()
+
+        # Per-bucket buffers for graph parameters
+        self._inflight_slot_indices: dict[int, torch.Tensor] = {}
+        self._inflight_write_positions: dict[int, torch.Tensor] = {}
+        self._inflight_position_ids: dict[int, torch.Tensor] = {}
+        self._inflight_attn_mask: dict[int, torch.Tensor] = {}
+
+        for bsz in self._bucket_sizes:
+            in_buf = torch.zeros(bsz, 1, cp_hidden, dtype=dtype, device=device)
+            self._inflight_in_buf[bsz] = in_buf
+
+            slot_indices = torch.arange(bsz, device=device, dtype=torch.long)
+            write_positions = torch.full((bsz,), 2, device=device, dtype=torch.long)
+            position_ids = torch.full((bsz, 1), 2, device=device, dtype=torch.long)
+            attn_mask = torch.zeros(bsz, 1, 1, max_seq, device=device, dtype=torch.bool)
+            attn_mask[:, 0, 0, :3] = True
+            self._inflight_slot_indices[bsz] = slot_indices
+            self._inflight_write_positions[bsz] = write_positions
+            self._inflight_position_ids[bsz] = position_ids
+            self._inflight_attn_mask[bsz] = attn_mask
+
+            # Eager warmup
+            for _ in range(3):
+                _ = fwd(in_buf, position_ids, slot_indices, write_positions, attn_mask,
+                        max_state.k_caches, max_state.v_caches)
+            torch.cuda.synchronize()
+
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=pool):
+                out = fwd(in_buf, position_ids, slot_indices, write_positions, attn_mask,
+                          max_state.k_caches, max_state.v_caches)
+            self._inflight_graph[bsz] = (g, out)
+
+        self._compiled_model_fwd = object()  # sentinel
+        logger.info(
+            "code_predictor: in-flight + CUDA graphs captured (%s) for buckets %s",
+            compile_msg,
+            self._bucket_sizes,
+        )
 
     def _setup_kv_graphs(self) -> None:
         """KV-cache path: torch.compile prefill + decode forwards, capture one
@@ -639,6 +732,10 @@ class CodePredictorWrapper(nn.Module):
         self._model_dtype = next(self.model.parameters()).dtype
         self._lm_heads_list = list(self.lm_head)
         self._codec_embeds_list = list(self.model.codec_embedding)
+
+        if self._wrapper_config.use_inflight:
+            self._setup_inflight_graphs()
+            return
 
         if self._wrapper_config.use_kv_cache:
             # bf16 by default. Sampling-mode perceptual quality (DNSMOS) is
@@ -776,6 +873,11 @@ class CodePredictorWrapper(nn.Module):
         generator: torch.Generator | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Predict residual codebooks 1..G-1 autoregressively."""
+        if self._wrapper_config.use_inflight:
+            return self._forward_inflight(
+                layer0_code, layer0_embed, last_talker_hidden,
+                do_sample, temperature, top_k, top_p, generator,
+            )
         if self._wrapper_config.use_kv_cache:
             return self._forward_kv(
                 layer0_code, layer0_embed, last_talker_hidden,
@@ -998,6 +1100,151 @@ class CodePredictorWrapper(nn.Module):
             g_dec.replay()
 
             logits = lm_heads[step - 1](out_dec[:bsz, 0, :])
+            code = _sample(logits)
+            all_codes[:, step] = code.reshape(bsz)
+            last_code = code
+
+        return all_codes
+
+    # ------------------------------------------------------------------
+    #  Forward (in-flight) — token-flat per-token cache slot
+    # ------------------------------------------------------------------
+
+    @torch.inference_mode()
+    def _forward_inflight(
+        self,
+        layer0_code: torch.Tensor,
+        layer0_embed: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """Sub-talker AR loop using the token-flat in-flight path.
+
+        In this drop-in form every request in the same call still walks the
+        14-step AR loop together (the wrapper is invoked once per main
+        talker step and that call must return all Q codes). Within the call,
+        each step is a token-flat forward of width ``bsz``, but the cache
+        slot indices are stable per-request (one slot per row), so the path
+        is numerically equivalent to the KV-graph decode path while
+        leaving room for a future scheduler-level refactor to populate
+        rows with *different* cache_lens.
+        """
+        bsz = int(layer0_code.shape[0])
+        num_groups = self._num_groups
+        device = layer0_code.device
+
+        self._setup_compile()
+        dtype = self._model_dtype
+
+        padded_bsz = self._padded_bsz(bsz)
+        in_buf = self._inflight_in_buf[padded_bsz]
+        g, out_buf = self._inflight_graph[padded_bsz]
+        state = self._inflight_state  # K/V buffers shared across buckets
+
+        # Per-bucket graph parameters (graph reads these tensors)
+        si_buf = self._inflight_slot_indices[padded_bsz]
+        wp_buf = self._inflight_write_positions[padded_bsz]
+        pi_buf = self._inflight_position_ids[padded_bsz]
+        am_buf = self._inflight_attn_mask[padded_bsz]
+
+        projection = self.small_to_mtp_projection
+        lm_heads = self._lm_heads_list
+        codec_embeds = self._codec_embeds_list
+
+        # Zero out the slots we'll use (only first `bsz` slots).
+        for k, v in zip(state.k_caches, state.v_caches):
+            k[:padded_bsz].zero_()
+            v[:padded_bsz].zero_()
+
+        # Initialise slot_indices to identity [0, 1, ..., padded_bsz-1]
+        si_buf.copy_(torch.arange(padded_bsz, device=device, dtype=torch.long))
+        max_seq = state.max_seq
+        ar = torch.arange(max_seq, device=device)
+
+        # Sampling helpers
+        stored_mode = self._wrapper_config.sampling_mode == "stored"
+        if stored_mode:
+            s_top_k = self._top_k
+            s_top_p = self._top_p
+            use_sampling = True
+            inv_temperature = 0.0
+        else:
+            use_sampling = do_sample and temperature > 0
+            inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
+            if use_sampling and top_p != 1.0:
+                raise NotImplementedError(
+                    "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
+                )
+
+        def _sample(logits: torch.Tensor) -> torch.Tensor:
+            if stored_mode:
+                if s_top_k > 0:
+                    topk_vals, _ = logits.topk(s_top_k, dim=-1)
+                    logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
+                if s_top_p < 1.0:
+                    sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+                    sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
+                    cumulative_probs = sorted_probs.cumsum(dim=-1)
+                    remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
+                    sorted_logits[remove_mask] = float("-inf")
+                    logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
+                probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+                return torch.multinomial(probs, num_samples=1, generator=generator)
+            if use_sampling:
+                scaled = logits * inv_temperature
+                if top_k > 0:
+                    topk_vals, _ = scaled.topk(top_k, dim=-1)
+                    scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+                probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
+                return torch.multinomial(probs, num_samples=1, generator=generator)
+            return logits.argmax(dim=-1, keepdim=True)
+
+        def _update_state_for_step(cache_lens_int: int) -> None:
+            """All padded_bsz rows share the same cache_len (in-call lock-step).
+            Padded rows beyond `bsz` write to padding slots; their input is
+            already zeroed below."""
+            wp_buf.fill_(cache_lens_int)
+            pi_buf.fill_(cache_lens_int)
+            am_buf.zero_()
+            am_buf[:, 0, 0, : cache_lens_int + 1] = True
+
+        all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
+        all_codes[:, 0] = layer0_code.reshape(bsz)
+
+        # Step 0: position 0 input = projection(last_talker_hidden), cache_len=0.
+        pos0_in = projection(last_talker_hidden.reshape(bsz, 1, -1).to(dtype))
+        in_buf.zero_()
+        in_buf[:bsz, :, :] = pos0_in
+        _update_state_for_step(cache_lens_int=0)
+        g.replay()
+        # out_buf at row [:bsz, 0, :] is hidden_state after writing slot[0].
+        # No code sampled at step 0 (layer0_code already provided).
+
+        # Step 1: position 1 input = projection(layer0_embed), cache_len=1.
+        # After this step we sample code at logical position 1 via lm_heads[0].
+        pos1_in = projection(layer0_embed.reshape(bsz, 1, -1).to(dtype))
+        in_buf.zero_()
+        in_buf[:bsz, :, :] = pos1_in
+        _update_state_for_step(cache_lens_int=1)
+        g.replay()
+        logits = lm_heads[0](out_buf[:bsz, 0, :])
+        code = _sample(logits)
+        all_codes[:, 1] = code.reshape(bsz)
+        last_code = code
+
+        # Steps 2..G-1: decode, cache_len = step at start.
+        for step in range(2, num_groups):
+            new_embed = codec_embeds[step - 2](last_code)
+            next_in = projection(new_embed.reshape(bsz, 1, -1))
+            in_buf.zero_()
+            in_buf[:bsz, :, :] = next_in
+            _update_state_for_step(cache_lens_int=step)
+            g.replay()
+            logits = lm_heads[step - 1](out_buf[:bsz, 0, :])
             code = _sample(logits)
             all_codes[:, step] = code.reshape(bsz)
             last_code = code

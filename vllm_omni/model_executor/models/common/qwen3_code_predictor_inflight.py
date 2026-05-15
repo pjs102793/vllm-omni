@@ -257,14 +257,18 @@ class CodePredictorBaseModelInflight(nn.Module):
     def forward(
         self,
         inputs_embeds: torch.Tensor,  # [N, 1, H]
-        state: InflightCacheState,
+        position_ids: torch.Tensor,  # [N, 1]
+        slot_indices: torch.Tensor,  # [N]
+        write_positions: torch.Tensor,  # [N]
+        attn_mask: torch.Tensor,  # [N, 1, 1, max_seq]
+        k_caches: list[torch.Tensor],
+        v_caches: list[torch.Tensor],
     ) -> torch.Tensor:
         input_dtype = inputs_embeds.dtype
-        pe = self.rotary_emb(inputs_embeds, state.position_ids.unsqueeze(-1))
-        # rotary_emb returns cos/sin shaped [N, 1, head_dim]; that matches our attention expectation.
+        pe = self.rotary_emb(inputs_embeds, position_ids)
         h = inputs_embeds
-        for layer, k, v in zip(self.layers, state.k_caches, state.v_caches):
-            h = layer(h, pe, k, v, state.slot_indices, state.write_positions, state.attn_mask)
+        for layer, k, v in zip(self.layers, k_caches, v_caches):
+            h = layer(h, pe, k, v, slot_indices, write_positions, attn_mask)
         h = self.norm(h)
         return h.to(input_dtype)
 

@@ -37,12 +37,21 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         prefix: str = "code_predictor",
     ) -> None:
         use_kv_cache = os.environ.get("QWEN3_TTS_USE_KV_CACHE", "0") == "1"
-        if use_kv_cache and current_omni_platform.is_npu():
+        use_inflight = os.environ.get("QWEN3_TTS_USE_INFLIGHT", "0") == "1"
+        if (use_kv_cache or use_inflight) and current_omni_platform.is_npu():
             logger.warning(
-                "QWEN3_TTS_USE_KV_CACHE=1 is not supported on NPU; falling back to re-prefill path."
+                "QWEN3_TTS_USE_KV_CACHE / QWEN3_TTS_USE_INFLIGHT not supported on NPU; "
+                "falling back to re-prefill path."
             )
             use_kv_cache = False
-        if use_kv_cache:
+            use_inflight = False
+        if use_inflight:
+            use_kv_cache = False  # inflight implies its own cache; don't double-route
+            logger.info(
+                "code_predictor: in-flight PoC enabled via QWEN3_TTS_USE_INFLIGHT=1 "
+                "(token-flat per-token cache slot; one graph per bucket)."
+            )
+        elif use_kv_cache:
             logger.info(
                 "code_predictor: KV-cache PoC enabled via QWEN3_TTS_USE_KV_CACHE=1 "
                 "(prefill + decode graphs captured per bucket)."
@@ -52,12 +61,13 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
             vllm_config=vllm_config,
             cp_config=config,
             wrapper_config=CodePredictorWrapperConfig(
-                use_cuda_graphs=not use_kv_cache,
+                use_cuda_graphs=not (use_kv_cache or use_inflight),
                 use_parallel_embedding=False,
                 use_projection=(config.hidden_size != talker_config.hidden_size),
                 return_proj_buf=False,
                 sampling_mode="per_call",
                 use_kv_cache=use_kv_cache,
+                use_inflight=use_inflight,
             ),
             talker_hidden_size=int(talker_config.hidden_size),
             prefix=prefix,
