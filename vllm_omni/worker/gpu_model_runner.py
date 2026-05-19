@@ -1304,48 +1304,130 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
             decode_req_ids = []
-            for req_index, req_id in enumerate(self.input_batch.req_ids):
-                req_infos = self.model_intermediate_buffer.get(req_id, {})
 
-                # mimo-audio check
-                req_state = self.requests.get(req_id)
-                req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
+            # --- Fast path: all-decode + model supports batched preprocess ----
+            # Detect "all rows are decode (span_len=1) with talker_mtp"; this is
+            # the dominant AR-loop case and benefits most from amortizing the
+            # per-row Python loop (~25ms on bs=64) into one batched call.
+            # Opt-out via QWEN3_TTS_DISABLE_BATCH_PREPROCESS=1.
+            import os as _osbp
+            _bp_off = _osbp.environ.get("QWEN3_TTS_DISABLE_BATCH_PREPROCESS", "0") == "1"
+            _num_reqs_bp = len(self.input_batch.req_ids)
+            _sched = scheduler_output.num_scheduled_tokens
+            all_decode = (
+                not _bp_off
+                and self.has_talker_mtp
+                and _num_reqs_bp > 0
+                and all(int(_sched.get(rid, 0)) == 1 for rid in self.input_batch.req_ids[:_num_reqs_bp])
+                and hasattr(self.model, "batch_preprocess_decode")
+            )
 
-                start_offset = int(self.query_start_loc.cpu[req_index])
-                sched_tokens = int(num_scheduled_tokens_np[req_index])
-                s, e = start_offset, start_offset + sched_tokens
-                span_len = int(e) - int(s)
+            if all_decode:
+                N = _num_reqs_bp
+                # Collect per-request info + GPU tensor references in one Python pass.
+                req_ids_list = list(self.input_batch.req_ids[:N])
+                req_infos_list: list[dict] = []
+                for req_id in req_ids_list:
+                    req_infos = self.model_intermediate_buffer.get(req_id, {})
+                    req_state = self.requests.get(req_id)
+                    req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
+                    req_infos["request_id"] = req_id
+                    req_infos_list.append(req_infos)
 
-                # call the custom process function
-                req_infos["request_id"] = req_id
-                embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
-                req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                    input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
+                # One batched call: returns per-request info_updates and bulk
+                # tensors for runner-side bulk-copy into talker_mtp_* buffers.
+                bp_out = self.model.batch_preprocess_decode(
+                    input_ids[:N],
+                    req_infos_list,
                 )
+                embeds_batch = bp_out["embeds"]
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
-                        (input_ids.shape[0], req_embeds.shape[-1]),
-                        device=req_embeds.device,
-                        dtype=req_embeds.dtype,
+                        (input_ids.shape[0], embeds_batch.shape[-1]),
+                        device=embeds_batch.device,
+                        dtype=embeds_batch.dtype,
                     )
+                # Bulk copy into talker_mtp_* buffers.
+                self.talker_mtp_input_ids.gpu[:N].copy_(bp_out["input_ids"])
+                self.talker_mtp_inputs_embeds.gpu[:N].copy_(embeds_batch)
+                self.last_talker_hidden.gpu[:N].copy_(bp_out["last_hidden"])
+                self.text_step.gpu[:N].copy_(bp_out["text_step"])
+                decode_req_ids = req_ids_list
 
-                if self.has_talker_mtp and span_len == 1:
-                    last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
-                    decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
-                    self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
-                    self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
-                    self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
-                    self.text_step.gpu[decode_slice].copy_(text_step)
-                    decode_req_ids.append(req_id)
+                # Bulk write inputs_embeds at each request's slot. For pure decode
+                # batches, query_start_loc[i] == i (1 token per req).
+                inputs_embeds[:N] = embeds_batch
 
-                # TODO(Peiqi): the merge stage could move out from the critical path
-                self._merge_additional_information_update(req_id, update_dict)
+                # Fast inline merge — skip _update_intermediate_buffer's
+                # per-row function call, gpu_keys check, and _store_value
+                # indirection (was ~88μs/row → 5.6ms on bs=64). Decode path
+                # only needs to update trailing_text + codec_streaming, both
+                # already in their final form (GPU tensor refs, cached bool).
+                imb = self.model_intermediate_buffer
+                for req_id, upd in zip(req_ids_list, bp_out["info_updates"]):
+                    existing = imb.get(req_id)
+                    if existing is None:
+                        existing = {}
+                        imb[req_id] = existing
+                    hs_upd = upd.get("hidden_states")
+                    if hs_upd:
+                        hs = existing.get("hidden_states")
+                        if hs is None:
+                            hs = {}
+                            existing["hidden_states"] = hs
+                        hs.update(hs_upd)
+                    meta_upd = upd.get("meta")
+                    if meta_upd:
+                        meta = existing.get("meta")
+                        if meta is None:
+                            meta = {}
+                            existing["meta"] = meta
+                        meta.update(meta_upd)
+            else:
+                # Slow path: per-request preprocess (prefill, mixed batches, or
+                # models without batch_preprocess_decode).
+                for req_index, req_id in enumerate(self.input_batch.req_ids):
+                    req_infos = self.model_intermediate_buffer.get(req_id, {})
 
-                # update the inputs_embeds and input_ids
-                seg_len = min(span_len, req_embeds.shape[0])
-                inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
-                if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
-                    input_ids[s : s + seg_len] = req_input_ids
+                    # mimo-audio check
+                    req_state = self.requests.get(req_id)
+                    req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
+
+                    start_offset = int(self.query_start_loc.cpu[req_index])
+                    sched_tokens = int(num_scheduled_tokens_np[req_index])
+                    s, e = start_offset, start_offset + sched_tokens
+                    span_len = int(e) - int(s)
+
+                    # call the custom process function
+                    req_infos["request_id"] = req_id
+                    embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
+                    req_input_ids, req_embeds, update_dict = self.model.preprocess(
+                        input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
+                    )
+                    if inputs_embeds is None:
+                        inputs_embeds = torch.empty(
+                            (input_ids.shape[0], req_embeds.shape[-1]),
+                            device=req_embeds.device,
+                            dtype=req_embeds.dtype,
+                        )
+
+                    if self.has_talker_mtp and span_len == 1:
+                        last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
+                        decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
+                        self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
+                        self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
+                        self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
+                        self.text_step.gpu[decode_slice].copy_(text_step)
+                        decode_req_ids.append(req_id)
+
+                    # TODO(Peiqi): the merge stage could move out from the critical path
+                    self._merge_additional_information_update(req_id, update_dict)
+
+                    # update the inputs_embeds and input_ids
+                    seg_len = min(span_len, req_embeds.shape[0])
+                    inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
+                    if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
+                        input_ids[s : s + seg_len] = req_input_ids
 
             # run talker mtp decode
             if self.has_talker_mtp:

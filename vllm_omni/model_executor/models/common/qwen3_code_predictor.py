@@ -265,6 +265,89 @@ class CodePredictorMLP(nn.Module):
 
 
 # ===================================================================
+#  INT8 weight-only quant (W8A16) for memory-bound sub-talker decode.
+#
+#  Stores weights as int8 + per-row scale. Uses torch._weight_int8pack_mm
+#  which fuses dequant + matmul in one kernel, halving the weight-load
+#  bandwidth on the AR loop's repeated decode steps.
+# ===================================================================
+
+
+class Int8WeightOnlyLinear(nn.Module):
+    """Drop-in replacement for nn.Linear with int8-quantized weights.
+
+    forward(): activations stay bf16; ``torch._weight_int8pack_mm`` dequant +
+    matmuls in a single kernel.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool, dtype: torch.dtype = torch.bfloat16) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # int8 weights stored as [out, in] (matches nn.Linear layout).
+        self.register_buffer("weight_int8", torch.zeros(out_features, in_features, dtype=torch.int8))
+        # Per-row scale (one per output channel).
+        self.register_buffer("scale", torch.zeros(out_features, dtype=dtype))
+        self.bias = nn.Parameter(torch.zeros(out_features, dtype=dtype)) if bias else None
+
+    @classmethod
+    def from_linear(cls, lin: nn.Linear, dtype: torch.dtype = torch.bfloat16) -> "Int8WeightOnlyLinear":
+        """Convert a trained nn.Linear into an int8 weight-only Linear.
+
+        Symmetric per-output-row quant: scale = max(|w|) / 127.
+        """
+        w = lin.weight.data.to(torch.float32)  # quant math in fp32 for stability
+        absmax = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+        scale_per_row = (absmax / 127.0).squeeze(-1)
+        w_int8 = (lin.weight.data / scale_per_row.unsqueeze(-1).to(lin.weight.dtype)).round().clamp(-127, 127).to(torch.int8)
+        m = cls(lin.in_features, lin.out_features, bias=lin.bias is not None, dtype=dtype)
+        m.weight_int8.copy_(w_int8)
+        m.scale.copy_(scale_per_row.to(dtype))
+        if lin.bias is not None:
+            m.bias.data.copy_(lin.bias.data.to(dtype))
+        # Match device of the source layer.
+        device = lin.weight.device
+        m.weight_int8 = m.weight_int8.to(device)
+        m.scale = m.scale.to(device)
+        if m.bias is not None:
+            m.bias = nn.Parameter(m.bias.data.to(device))
+        return m
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [..., in_features] in bf16. Fused dequant + matmul.
+        # torch._weight_int8pack_mm signature: (input [M, K], weight [N, K] int8, scales [N]) -> [M, N]
+        orig_shape = x.shape
+        if x.dim() > 2:
+            x_2d = x.reshape(-1, orig_shape[-1])
+        else:
+            x_2d = x
+        x_2d = x_2d.contiguous()
+        out = torch._weight_int8pack_mm(x_2d, self.weight_int8, self.scale)
+        if x.dim() > 2:
+            out = out.reshape(*orig_shape[:-1], self.out_features)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+
+def _quantize_linears_int8(module: nn.Module, dtype: torch.dtype = torch.bfloat16, _path: str = "") -> int:
+    """Walk a module tree and swap every nn.Linear with Int8WeightOnlyLinear in place.
+
+    Returns the number of layers swapped.
+    """
+    swapped = 0
+    for name, child in list(module.named_children()):
+        full = f"{_path}.{name}" if _path else name
+        if isinstance(child, nn.Linear):
+            new = Int8WeightOnlyLinear.from_linear(child, dtype=dtype)
+            setattr(module, name, new)
+            swapped += 1
+        else:
+            swapped += _quantize_linears_int8(child, dtype=dtype, _path=full)
+    return swapped
+
+
+# ===================================================================
 #  Decoder Layer
 # ===================================================================
 
@@ -597,7 +680,7 @@ class CodePredictorWrapper(nn.Module):
             for _ in range(3):
                 _ = decode_fwd(
                     dec_in, dec_pos, state.k_caches, state.v_caches,
-                    state.write_idx, state.attn_mask,
+                    state.write_idx, state.attn_mask, state.cache_len,
                 )
             torch.cuda.synchronize()
 
@@ -616,7 +699,7 @@ class CodePredictorWrapper(nn.Module):
             with torch.cuda.graph(g_dec, pool=pool):
                 out_dec = decode_fwd(
                     dec_in, dec_pos, state.k_caches, state.v_caches,
-                    state.write_idx, state.attn_mask,
+                    state.write_idx, state.attn_mask, state.cache_len,
                 )
             self._kv_decode_graph[bsz] = (g_dec, out_dec)
 
@@ -1033,5 +1116,21 @@ class CodePredictorWrapper(nn.Module):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, w)
             loaded.add(name)
+
+        # Optional: INT8 weight-only quant for the sub-talker transformer
+        # layers (memory-bound on L40S). Halves weight bandwidth on every
+        # AR decode step via ``torch._weight_int8pack_mm`` (fused dequant +
+        # matmul). Only the inner transformer layers — not embedding /
+        # lm_head / norm — are touched. Opt-in via ``QWEN3_TTS_KV_INT8=1``.
+        import os as _os_q
+        if _os_q.environ.get("QWEN3_TTS_KV_INT8", "0") == "1":
+            # Determine dtype from first model parameter (load_weights has just
+            # populated weights so this is reliable).
+            _model_dtype = next(self.model.parameters()).dtype
+            n_swapped = _quantize_linears_int8(self.model.layers, dtype=_model_dtype)
+            logger.info(
+                "code_predictor: INT8 weight-only quant applied to %d Linears in sub-talker layers (dtype=%s)",
+                n_swapped, _model_dtype,
+            )
 
         return loaded

@@ -683,6 +683,115 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         }
         return input_ids, inputs_embeds_out, info_update
 
+    def batch_preprocess_decode(
+        self,
+        input_ids_batch: torch.Tensor,  # [N] long, one token per request
+        req_infos_list: list[dict[str, Any]],  # length N, each is the per-req info dict
+    ) -> dict[str, Any]:
+        """Batched decode-only fast path for preprocess (v2 — aggressive).
+
+        Differs from a per-request loop in three places:
+
+        1. No per-row ``.to(device, dtype)`` / ``.reshape(1, -1)`` chains —
+           GPU tensors stored in ``model_intermediate_buffer`` are already
+           device-resident bf16 (see gpu_resident_buffer_keys). A bare tensor
+           reference is collected in Python and ``torch.stack`` builds the
+           batched view in **one** kernel.
+        2. Skip re-merging ``additional_information`` when the caller has
+           already flattened it (marked with ``info_dict["_flat"] = True``).
+        3. ``codec_streaming`` is derived once per request at prefill time and
+           cached, instead of being recomputed every decode step.
+
+        Output layout matches the per-row :meth:`preprocess` return:
+        ``input_ids``, ``embeds``, ``last_hidden``, ``text_step``, and a list
+        of per-request ``info_updates`` for the runner to merge.
+        """
+        N = int(input_ids_batch.shape[0])
+
+        # 1) Batched embed lookup for the new-token id per request.
+        ids_for_embed = input_ids_batch.reshape(N, 1).to(torch.long)
+        embeds_batch = self.embed_input_ids(ids_for_embed).to(dtype=torch.bfloat16).reshape(N, -1)
+
+        # 2) Gather GPU tensor refs in a tight Python loop. No GPU ops here —
+        # the tensors are already on-device and in bf16 (gpu_resident_buffer).
+        last_hidden_refs: list[torch.Tensor] = []
+        text_step_refs: list[torch.Tensor] = []
+        new_tail_refs: list[torch.Tensor | None] = []
+        codec_streaming_flags: list[bool] = []
+
+        for info_dict in req_infos_list:
+            # Skip additional_information merging if caller marked it flat.
+            if not info_dict.get("_flat"):
+                additional_information = info_dict.get("additional_information")
+                if isinstance(additional_information, dict):
+                    merged: dict[str, Any] = {
+                        k: v for k, v in info_dict.items() if k != "additional_information"
+                    }
+                    for k, v in additional_information.items():
+                        merged.setdefault(k, v)
+                    info_dict.clear()
+                    info_dict.update(merged)
+                info_dict["_flat"] = True
+
+            embed = info_dict.get("embed") or {}
+            hs = info_dict.get("hidden_states") or {}
+            meta = info_dict.get("meta") or {}
+
+            # codec_streaming: cached per request (set once at prefill).
+            cs_cached = info_dict.get("_cs")
+            if cs_cached is None:
+                task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
+                cs_raw = meta.get("codec_streaming")
+                if isinstance(cs_raw, list):
+                    cs_raw = cs_raw[0] if cs_raw else None
+                cs_cached = cs_raw if isinstance(cs_raw, bool) else (task_type == "Base")
+                info_dict["_cs"] = cs_cached
+            codec_streaming_flags.append(bool(cs_cached))
+
+            tts_pad_embed = embed.get("tts_pad")
+            if not isinstance(tts_pad_embed, torch.Tensor):
+                raise RuntimeError("Missing `tts_pad_embed`; prefill must run first.")
+
+            tail = hs.get("trailing_text")
+            if isinstance(tail, torch.Tensor) and tail.ndim == 2 and tail.shape[0] > 0:
+                text_step_refs.append(tail[0])  # [H], no reshape/to needed
+                new_tail_refs.append(tail[1:] if tail.shape[0] > 1 else tail[:0])
+            else:
+                # Use tts_pad_embed as the placeholder text-step row.
+                text_step_refs.append(
+                    tts_pad_embed if tts_pad_embed.ndim == 1 else tts_pad_embed.reshape(-1)
+                )
+                new_tail_refs.append(tail if isinstance(tail, torch.Tensor) else None)
+
+            last_hidden = hs.get("last")
+            if not isinstance(last_hidden, torch.Tensor):
+                raise RuntimeError("Missing hidden_states['last']; postprocess must run.")
+            last_hidden_refs.append(last_hidden if last_hidden.ndim == 1 else last_hidden.reshape(-1))
+
+        # 3) ONE batched stack each — single kernel launch per output tensor.
+        last_hidden_batch = torch.stack(last_hidden_refs, dim=0)  # [N, H]
+        text_step_batch = torch.stack(text_step_refs, dim=0)  # [N, H]
+
+        # 4) Build info_updates. These are cheap CPU dict allocations.
+        info_updates: list[dict[str, Any]] = []
+        for idx, new_tail in enumerate(new_tail_refs):
+            info_updates.append(
+                {
+                    "hidden_states": {"trailing_text": new_tail}
+                    if new_tail is not None
+                    else {},
+                    "meta": {"codec_streaming": codec_streaming_flags[idx]},
+                }
+            )
+
+        return {
+            "input_ids": input_ids_batch,
+            "embeds": embeds_batch,
+            "last_hidden": last_hidden_batch,
+            "text_step": text_step_batch,
+            "info_updates": info_updates,
+        }
+
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
         # Keep the last token hidden for the next decode step's code predictor.
         # Stays on GPU - gpu_resident_buffer_keys avoids the CPU round-trip.
