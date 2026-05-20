@@ -28,6 +28,16 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
+# Optional flashinfer-fused sampler (top-K + sample in one kernel).
+try:
+    from flashinfer.sampling import (
+        top_k_sampling_from_probs as _fi_topk_sample,
+        top_k_top_p_sampling_from_probs as _fi_topk_topp_sample,
+    )
+    _HAS_FLASHINFER_SAMPLING = True
+except ImportError:
+    _HAS_FLASHINFER_SAMPLING = False
+
 
 # ===================================================================
 # HF-numerics-compatible layers for code predictor
@@ -597,7 +607,7 @@ class CodePredictorWrapper(nn.Module):
             for _ in range(3):
                 _ = decode_fwd(
                     dec_in, dec_pos, state.k_caches, state.v_caches,
-                    state.write_idx, state.attn_mask, state.cache_len,
+                    state.write_idx, state.attn_mask,
                 )
             torch.cuda.synchronize()
 
@@ -616,7 +626,7 @@ class CodePredictorWrapper(nn.Module):
             with torch.cuda.graph(g_dec, pool=pool):
                 out_dec = decode_fwd(
                     dec_in, dec_pos, state.k_caches, state.v_caches,
-                    state.write_idx, state.attn_mask, state.cache_len,
+                    state.write_idx, state.attn_mask,
                 )
             self._kv_decode_graph[bsz] = (g_dec, out_dec)
 
@@ -852,28 +862,48 @@ class CodePredictorWrapper(nn.Module):
 
             # Sample next code
             if stored_mode:
-                # "stored" mode: top-k -> top-p -> softmax -> multinomial
-                if s_top_k > 0:
-                    topk_vals, _ = logits.topk(s_top_k, dim=-1)
-                    logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
-                if s_top_p < 1.0:
-                    sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
-                    sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
-                    cumulative_probs = sorted_probs.cumsum(dim=-1)
-                    remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
-                    sorted_logits[remove_mask] = float("-inf")
-                    logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-                probs = F.softmax(logits, dim=-1, dtype=torch.float32)
-                code = torch.multinomial(probs, num_samples=1, generator=generator)
+                # "stored" mode: top-k + top-p sampling
+                if _HAS_FLASHINFER_SAMPLING:
+                    probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+                    if s_top_p < 1.0:
+                        code = _fi_topk_topp_sample(
+                            probs, s_top_k, s_top_p,
+                            generator=generator,
+                        ).long().unsqueeze(-1)
+                    else:
+                        code = _fi_topk_sample(
+                            probs, s_top_k,
+                            generator=generator,
+                        ).long().unsqueeze(-1)
+                else:
+                    if s_top_k > 0:
+                        topk_vals, _ = logits.topk(s_top_k, dim=-1)
+                        logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
+                    if s_top_p < 1.0:
+                        sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+                        sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
+                        cumulative_probs = sorted_probs.cumsum(dim=-1)
+                        remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
+                        sorted_logits[remove_mask] = float("-inf")
+                        logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
+                    probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+                    code = torch.multinomial(probs, num_samples=1, generator=generator)
             else:
                 # "per_call" mode: temperature-scaled + top-k
                 if use_sampling:
                     scaled = logits * inv_temperature
-                    if top_k > 0:
-                        topk_vals, _ = scaled.topk(top_k, dim=-1)
-                        scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                    probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
-                    code = torch.multinomial(probs, num_samples=1, generator=generator)
+                    if _HAS_FLASHINFER_SAMPLING and top_k > 0:
+                        probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
+                        code = _fi_topk_sample(
+                            probs, top_k,
+                            generator=generator,
+                        ).long().unsqueeze(-1)
+                    else:
+                        if top_k > 0:
+                            topk_vals, _ = scaled.topk(top_k, dim=-1)
+                            scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+                        probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
+                        code = torch.multinomial(probs, num_samples=1, generator=generator)
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)
 
@@ -960,6 +990,17 @@ class CodePredictorWrapper(nn.Module):
 
         def _sample(logits: torch.Tensor) -> torch.Tensor:
             if stored_mode:
+                if _HAS_FLASHINFER_SAMPLING:
+                    probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+                    if s_top_p < 1.0:
+                        return _fi_topk_topp_sample(
+                            probs, s_top_k, s_top_p,
+                            generator=generator,
+                        ).long().unsqueeze(-1)
+                    return _fi_topk_sample(
+                        probs, s_top_k,
+                        generator=generator,
+                    ).long().unsqueeze(-1)
                 if s_top_k > 0:
                     topk_vals, _ = logits.topk(s_top_k, dim=-1)
                     logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
@@ -974,6 +1015,12 @@ class CodePredictorWrapper(nn.Module):
                 return torch.multinomial(probs, num_samples=1, generator=generator)
             if use_sampling:
                 scaled = logits * inv_temperature
+                if _HAS_FLASHINFER_SAMPLING and top_k > 0:
+                    probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
+                    return _fi_topk_sample(
+                        probs, top_k,
+                        generator=generator,
+                    ).long().unsqueeze(-1)
                 if top_k > 0:
                     topk_vals, _ = scaled.topk(top_k, dim=-1)
                     scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
