@@ -36,18 +36,37 @@ from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
     _rotate_half,
 )
 
-# SDPA backend priority. Prefill (is_causal=True, no attn_mask) takes the
-# FLASH path. Decode uses a bool attn_mask, which EFFICIENT_ATTENTION supports
-# while keeping fp32 reductions on bf16 inputs. MATH stays as a hard fallback.
+# SDPA backend selection.
+#
+# The combination ``enable_gqa=True`` + ``attn_mask`` blocks **all** fused
+# kernels (FLASH/EFFICIENT/CUDNN) — PyTorch's GQA broadcasting path falls
+# back to MATH (~30µs at bs=8 in CUDA graph). We instead expand K/V to
+# match Q's head count *manually* and drop ``enable_gqa``, which lets the
+# default dispatch pick EFFICIENT_ATTENTION (~10µs, 3× faster than MATH).
+#
+# Even faster: CUDNN_ATTENTION at ~6µs (~5× MATH), but vLLM globally
+# disables cudnn_sdp at startup (platforms/cuda.py:49) for safety
+# (PyTorch 2.5 cuDNN default crashed some diffusion models). A priority
+# list like ``[CUDNN, EFFICIENT, MATH]`` still skips CUDNN due to that
+# gate; only a single-backend ``[CUDNN]`` override bypasses it.
+#
+# Default: ``[EFFICIENT, MATH]`` — safe, 3× MATH baseline.
+# Opt-in: ``QWEN3_TTS_CUDNN_SDPA=1`` switches decode to ``[CUDNN]`` for
+# the extra ~40% on top (10µs → 6µs).
+import os as _os_sdpa
+_CUDNN_SDPA = _os_sdpa.environ.get("QWEN3_TTS_CUDNN_SDPA", "0") == "1"
 _SDPA_PREFILL_BACKENDS = [
     SDPBackend.FLASH_ATTENTION,
     SDPBackend.EFFICIENT_ATTENTION,
     SDPBackend.MATH,
 ]
-_SDPA_DECODE_BACKENDS = [
-    SDPBackend.EFFICIENT_ATTENTION,
-    SDPBackend.MATH,
-]
+if _CUDNN_SDPA:
+    _SDPA_DECODE_BACKENDS = [SDPBackend.CUDNN_ATTENTION]
+else:
+    _SDPA_DECODE_BACKENDS = [
+        SDPBackend.EFFICIENT_ATTENTION,
+        SDPBackend.MATH,
+    ]
 
 
 @dataclass
@@ -101,9 +120,10 @@ class CodePredictorAttentionKVGraph(nn.Module):
         self.max_seq = int(config.num_code_groups) + 1
 
         bias = getattr(config, "attention_bias", False)
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=bias)
+        # Fused QKV (see CodePredictorAttention for rationale: ~2.6× faster).
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.qkv_proj = nn.Linear(self.hidden_size, self.q_size + 2 * self.kv_size, bias=bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -113,9 +133,11 @@ class CodePredictorAttentionKVGraph(nn.Module):
         hsq = (bsz, s, self.num_heads, self.head_dim)
         hskv = (bsz, s, self.num_kv_heads, self.head_dim)
 
-        q = self.q_norm(self.q_proj(hidden_states).view(hsq)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(hidden_states).view(hskv)).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(hskv).transpose(1, 2)
+        qkv = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q = self.q_norm(q.view(hsq)).transpose(1, 2)
+        k = self.k_norm(k.view(hskv)).transpose(1, 2)
+        v = v.view(hskv).transpose(1, 2)
 
         cos, sin = position_embeddings
         cos = cos.unsqueeze(1)
@@ -137,14 +159,23 @@ class CodePredictorAttentionKVGraph(nn.Module):
         k_cache[:, :, :s, :] = k_new
         v_cache[:, :, :s, :] = v_new
 
+        # Manual GQA expand (see module-level comment). Prefill has no mask;
+        # FLASH_ATTENTION supports GQA via enable_gqa, so we can take either
+        # path. Keep manual expand for consistency with decode.
+        if self.is_gqa:
+            nq_per_kv = q.shape[1] // k_new.shape[1]
+            k_attn = k_new.repeat_interleave(nq_per_kv, dim=1)
+            v_attn = v_new.repeat_interleave(nq_per_kv, dim=1)
+        else:
+            k_attn, v_attn = k_new, v_new
+
         with sdpa_kernel(_SDPA_PREFILL_BACKENDS):
             attn_out = F.scaled_dot_product_attention(
                 q,
-                k_new,
-                v_new,
+                k_attn,
+                v_attn,
                 scale=self.scaling,
                 is_causal=True,
-                enable_gqa=self.is_gqa,
             )
         attn_out = attn_out.transpose(1, 2).reshape(bsz, s, -1)
         return self.o_proj(attn_out)
@@ -166,15 +197,24 @@ class CodePredictorAttentionKVGraph(nn.Module):
         k_cache.index_copy_(2, idx, k_new)
         v_cache.index_copy_(2, idx, v_new)
 
+        # Manual GQA expand — see module-level comment. Without this,
+        # ``enable_gqa=True`` + ``attn_mask`` blocks all fused kernels and
+        # PyTorch falls back to MATH (~30µs vs ~10µs EFFICIENT at bs=8).
+        if self.is_gqa:
+            nq_per_kv = q.shape[1] // k_cache.shape[1]
+            k_attn = k_cache.repeat_interleave(nq_per_kv, dim=1)
+            v_attn = v_cache.repeat_interleave(nq_per_kv, dim=1)
+        else:
+            k_attn, v_attn = k_cache, v_cache
+
         with sdpa_kernel(_SDPA_DECODE_BACKENDS):
             attn_out = F.scaled_dot_product_attention(
                 q,
-                k_cache,
-                v_cache,
+                k_attn,
+                v_attn,
                 attn_mask=attn_mask,
                 scale=self.scaling,
                 is_causal=False,
-                enable_gqa=self.is_gqa,
             )
         attn_out = attn_out.transpose(1, 2).reshape(bsz, 1, -1)
         return self.o_proj(attn_out)
@@ -289,10 +329,62 @@ class CodePredictorBaseModelKVGraph(nn.Module):
         return h.to(input_dtype)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights with QKV / gate_up fusion remapping (same as base)."""
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded: set[str] = set()
+
+        def _remap(name: str) -> tuple[str, slice] | None:
+            if name.endswith(".q_proj.weight") or name.endswith(".q_proj.bias"):
+                base = name.rsplit(".q_proj.", 1)[0]
+                suffix = "weight" if name.endswith("weight") else "bias"
+                target = f"{base}.qkv_proj.{suffix}"
+                if target not in params_dict:
+                    return None
+                attn = self.get_submodule(base) if base else self
+                return target, slice(0, attn.q_size)
+            if name.endswith(".k_proj.weight") or name.endswith(".k_proj.bias"):
+                base = name.rsplit(".k_proj.", 1)[0]
+                suffix = "weight" if name.endswith("weight") else "bias"
+                target = f"{base}.qkv_proj.{suffix}"
+                if target not in params_dict:
+                    return None
+                attn = self.get_submodule(base) if base else self
+                return target, slice(attn.q_size, attn.q_size + attn.kv_size)
+            if name.endswith(".v_proj.weight") or name.endswith(".v_proj.bias"):
+                base = name.rsplit(".v_proj.", 1)[0]
+                suffix = "weight" if name.endswith("weight") else "bias"
+                target = f"{base}.qkv_proj.{suffix}"
+                if target not in params_dict:
+                    return None
+                attn = self.get_submodule(base) if base else self
+                return target, slice(attn.q_size + attn.kv_size, attn.q_size + 2 * attn.kv_size)
+            if name.endswith(".gate_proj.weight"):
+                base = name.rsplit(".gate_proj.", 1)[0]
+                target = f"{base}.gate_up_proj.weight"
+                if target not in params_dict:
+                    return None
+                mlp = self.get_submodule(base) if base else self
+                return target, slice(0, mlp.intermediate_size)
+            if name.endswith(".up_proj.weight"):
+                base = name.rsplit(".up_proj.", 1)[0]
+                target = f"{base}.gate_up_proj.weight"
+                if target not in params_dict:
+                    return None
+                mlp = self.get_submodule(base) if base else self
+                return target, slice(mlp.intermediate_size, 2 * mlp.intermediate_size)
+            return None
+
         for name, w in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            remap = _remap(name)
+            if remap is not None:
+                target_name, row_slice = remap
+                param = params_dict[target_name]
+                with torch.no_grad():
+                    param[row_slice].copy_(w)
+                # Mark the fused target as loaded.
+                loaded.add(target_name)
                 continue
             param = params_dict.get(name)
             if param is None:
