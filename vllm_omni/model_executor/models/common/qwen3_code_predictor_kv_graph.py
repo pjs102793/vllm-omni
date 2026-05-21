@@ -38,35 +38,39 @@ from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
 
 # SDPA backend selection.
 #
-# The combination ``enable_gqa=True`` + ``attn_mask`` blocks **all** fused
-# kernels (FLASH/EFFICIENT/CUDNN) — PyTorch's GQA broadcasting path falls
-# back to MATH (~30µs at bs=8 in CUDA graph). We instead expand K/V to
-# match Q's head count *manually* and drop ``enable_gqa``, which lets the
-# default dispatch pick EFFICIENT_ATTENTION (~10µs, 3× faster than MATH).
+# Problem chain we untangled:
+#   1. ``F.scaled_dot_product_attention(..., enable_gqa=True)`` rejects
+#      every fused backend (FLASH/EFFICIENT/CUDNN) because the GQA
+#      broadcasting path fails the "same num_heads" check. PyTorch then
+#      falls through to MATH (~30µs in CUDA graph at bs=8).
+#   2. Even when we expand K/V manually so fused backends are valid,
+#      PyTorch's default SDPA priority order is
+#      ``[FLASH, EFFICIENT, MATH, CUDNN, OVERRIDEABLE]`` — MATH is tried
+#      *before* CUDNN. For our shape (bool attn_mask + decode seq=1),
+#      FLASH and EFFICIENT are both rejected, so MATH still wins.
+#   3. vLLM also globally disables cudnn_sdp at import
+#      (platforms/cuda.py:49) for safety against PyTorch 2.5's default
+#      cuDNN dispatcher crashing some diffusion models. That further
+#      blocks CUDNN from being picked by any priority list.
 #
-# Even faster: CUDNN_ATTENTION at ~6µs (~5× MATH), but vLLM globally
-# disables cudnn_sdp at startup (platforms/cuda.py:49) for safety
-# (PyTorch 2.5 cuDNN default crashed some diffusion models). A priority
-# list like ``[CUDNN, EFFICIENT, MATH]`` still skips CUDNN due to that
-# gate; only a single-backend ``[CUDNN]`` override bypasses it.
+# Fix: ``sdpa_kernel(list, set_priority=True)``. This context manager
+#   (a) temporarily enables every backend in the list, bypassing
+#       vLLM's global disable, and
+#   (b) interprets the list order as the priority for this call, so
+#       CUDNN is tried before MATH.
+# It cleans up on exit, so vLLM's global cudnn-disabled safety is
+# preserved for everything outside the sub-talker.
 #
-# Default: ``[EFFICIENT, MATH]`` — safe, 3× MATH baseline.
-# Opt-in: ``QWEN3_TTS_CUDNN_SDPA=1`` switches decode to ``[CUDNN]`` for
-# the extra ~40% on top (10µs → 6µs).
-import os as _os_sdpa
-_CUDNN_SDPA = _os_sdpa.environ.get("QWEN3_TTS_CUDNN_SDPA", "0") == "1"
-_SDPA_PREFILL_BACKENDS = [
-    SDPBackend.FLASH_ATTENTION,
+# Backends listed CUDNN→EFFICIENT→FLASH→MATH — CUDNN handles GQA+mask
+# natively (~6µs at bs=8), EFFICIENT handles the manually-expanded path
+# (~10µs), FLASH is there in case prefill (no mask, causal) reaches it,
+# and MATH is the always-works fallback.
+_SDPA_BACKENDS = [
+    SDPBackend.CUDNN_ATTENTION,
     SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.FLASH_ATTENTION,
     SDPBackend.MATH,
 ]
-if _CUDNN_SDPA:
-    _SDPA_DECODE_BACKENDS = [SDPBackend.CUDNN_ATTENTION]
-else:
-    _SDPA_DECODE_BACKENDS = [
-        SDPBackend.EFFICIENT_ATTENTION,
-        SDPBackend.MATH,
-    ]
 
 
 @dataclass
@@ -159,9 +163,8 @@ class CodePredictorAttentionKVGraph(nn.Module):
         k_cache[:, :, :s, :] = k_new
         v_cache[:, :, :s, :] = v_new
 
-        # Manual GQA expand (see module-level comment). Prefill has no mask;
-        # FLASH_ATTENTION supports GQA via enable_gqa, so we can take either
-        # path. Keep manual expand for consistency with decode.
+        # Manual GQA expand (see module-level comment). Without this,
+        # ``enable_gqa=True`` blocks all fused backends.
         if self.is_gqa:
             nq_per_kv = q.shape[1] // k_new.shape[1]
             k_attn = k_new.repeat_interleave(nq_per_kv, dim=1)
@@ -169,7 +172,7 @@ class CodePredictorAttentionKVGraph(nn.Module):
         else:
             k_attn, v_attn = k_new, v_new
 
-        with sdpa_kernel(_SDPA_PREFILL_BACKENDS):
+        with sdpa_kernel(_SDPA_BACKENDS, set_priority=True):
             attn_out = F.scaled_dot_product_attention(
                 q,
                 k_attn,
@@ -197,9 +200,7 @@ class CodePredictorAttentionKVGraph(nn.Module):
         k_cache.index_copy_(2, idx, k_new)
         v_cache.index_copy_(2, idx, v_new)
 
-        # Manual GQA expand — see module-level comment. Without this,
-        # ``enable_gqa=True`` + ``attn_mask`` blocks all fused kernels and
-        # PyTorch falls back to MATH (~30µs vs ~10µs EFFICIENT at bs=8).
+        # Manual GQA expand — see module-level comment.
         if self.is_gqa:
             nq_per_kv = q.shape[1] // k_cache.shape[1]
             k_attn = k_cache.repeat_interleave(nq_per_kv, dim=1)
@@ -207,7 +208,7 @@ class CodePredictorAttentionKVGraph(nn.Module):
         else:
             k_attn, v_attn = k_cache, v_cache
 
-        with sdpa_kernel(_SDPA_DECODE_BACKENDS):
+        with sdpa_kernel(_SDPA_BACKENDS, set_priority=True):
             attn_out = F.scaled_dot_product_attention(
                 q,
                 k_attn,
