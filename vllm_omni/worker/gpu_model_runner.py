@@ -1517,12 +1517,24 @@ class OmniGPUModelRunner(GPUModelRunner):
         out_key = getattr(self.model, "talker_mtp_output_key", ("codes", "audio"))
         if not isinstance(out_key, tuple) or len(out_key) != 2:
             raise TypeError(f"talker_mtp_output_key must be a 2-tuple, got {type(out_key).__name__}: {out_key!r}")
-        for idx, req_id in enumerate(decode_req_ids):
-            req_index = self.input_batch.req_ids.index(req_id)
-            start_offset = int(self.query_start_loc.cpu[req_index])
-            inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
-            update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}
-            self._merge_additional_information_update(req_id, update_dict)
+        N = len(decode_req_ids)
+        batch_req_ids = self.input_batch.req_ids
+        # Fast path: when decode_req_ids matches input_batch.req_ids[:N] in order
+        # (the dominant all-decode case), one bulk GPU copy replaces N small ones.
+        aligned = N <= len(batch_req_ids) and decode_req_ids == list(batch_req_ids[:N])
+        if aligned and N > 0:
+            inputs_embeds[:N] = req_embeds[:N]
+            for idx, req_id in enumerate(decode_req_ids):
+                update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}
+                self._merge_additional_information_update(req_id, update_dict)
+        else:
+            req_id_to_idx = {rid: i for i, rid in enumerate(batch_req_ids)}
+            for idx, req_id in enumerate(decode_req_ids):
+                req_index = req_id_to_idx[req_id]
+                start_offset = int(self.query_start_loc.cpu[req_index])
+                inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
+                update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}
+                self._merge_additional_information_update(req_id, update_dict)
 
     def _model_forward(
         self,
