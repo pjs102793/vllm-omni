@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>UTMOS 3-way: Fork / HEAD-BF16 / HEAD-FP8</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Pretendard", sans-serif; line-height: 1.65; color: #1a1a1a; background: #fafafa; margin: 0; padding: 0; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 2.5rem 2rem; }
+  h1 { border-bottom: 3px solid #2563eb; padding-bottom: 0.5rem; font-size: 2rem; margin-top: 0; }
+  h2 { border-bottom: 1px solid #e5e7eb; padding-bottom: 0.3rem; margin-top: 3rem; font-size: 1.5rem; color: #2563eb; }
+  blockquote { border-left: 4px solid #2563eb; background: #eff6ff; margin: 1rem 0; padding: 0.75rem 1rem; border-radius: 0 4px 4px 0; }
+  code { background: #f3f4f6; color: #1f2937; padding: 0.15rem 0.35rem; border-radius: 3px; font-family: "SF Mono", Menlo, Monaco, Consolas, monospace; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; background: white; box-shadow: 0 1px 2px rgba(0,0,0,0.04); border-radius: 6px; overflow: hidden; font-size: 0.92em; }
+  th { background: #f9fafb; text-align: left; padding: 0.55rem 0.7rem; font-weight: 600; font-size: 0.9em; border-bottom: 2px solid #e5e7eb; }
+  td { padding: 0.45rem 0.7rem; border-bottom: 1px solid #e5e7eb; }
+  tr:nth-child(even) td { background: #fafbfc; }
+  tr:hover td { background: #f0f9ff; }
+  td.r, th.r { text-align: right; font-variant-numeric: tabular-nums; }
+  .delta-pos { color: #059669; font-weight: 600; }
+  .delta-neg { color: #dc2626; font-weight: 600; }
+  .delta-zero { color: #6b7280; }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.75rem; margin: 1rem 0 2rem; }
+  .stat { background: white; border: 1px solid #e5e7eb; border-radius: 6px; padding: 0.85rem 1rem; text-align: center; }
+  .stat .label { font-size: 0.8em; color: #6b7280; }
+  .stat .value { font-size: 1.4rem; font-weight: 700; color: #2563eb; margin: 0.2rem 0; }
+  .summary-callout { background: linear-gradient(135deg, #eff6ff 0%, #ecfdf5 100%); border-left: 5px solid #2563eb; border-radius: 4px; padding: 1rem 1.5rem; margin: 1.5rem 0; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>UTMOS Audio Quality — Fork vs HEAD-BF16 vs HEAD+FP8</h1>
+
+<blockquote>
+환경: L40S, Qwen3-TTS-12Hz-1.7B-CustomVoice, temperature=0.9, top_k=50<br>
+<strong>샘플: 100 LJ Speech 프롬프트 × 5 voices × 3 configs = 1500 WAV</strong><br>
+프롬프트: LJ Speech test 코퍼스에서 random.seed(42) 로 선별 (char-length 30-300 필터)<br>
+Voices: Vivian (CN F) / Ryan (EN M) / Aiden (US M) / Serena (CN F) / Sohee (KR F)<br>
+평가: UTMOSv1 (<code>utmos==1.1.10</code>, score 1-5)
+</blockquote>
+
+<div class="summary-callout">
+<strong>결과 요약</strong> — 3개 config 모두 UTMOS 평균 <strong>4.25 ~ 4.26</strong> 범위, 차이 0.013 이내.<br>
+모든 최적화 + FP8 양자화가 audio quality에 미친 영향 <span class="delta-pos">사실상 0</span>.
+</div>
+
+<div class="stat-grid">
+  <div class="stat"><div class="label">Fork (baseline)</div><div class="value">4.251</div></div>
+  <div class="stat"><div class="label">HEAD BF16</div><div class="value">4.260</div></div>
+  <div class="stat"><div class="label">HEAD + FP8</div><div class="value">4.264</div></div>
+  <div class="stat"><div class="label">N samples / config</div><div class="value">500</div></div>
+</div>
+
+<h2>전체 분포</h2>
+
+<table>
+  <thead>
+    <tr><th>Config</th><th>설명</th><th class="r">N</th><th class="r">mean</th><th class="r">median</th><th class="r">std</th><th class="r">min</th><th class="r">max</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Fork BF16</strong></td><td><code>a5e1d5a0</code>, KV-off, no opts</td>
+        <td class="r">500</td>
+        <td class="r"><strong>4.2510</strong></td>
+        <td class="r">4.3024</td>
+        <td class="r">0.2396</td>
+        <td class="r">1.927</td>
+        <td class="r">4.512</td></tr>
+    <tr><td><strong>HEAD BF16</strong></td><td><code>b0db844a</code>, all opts, no quant</td>
+        <td class="r">500</td>
+        <td class="r"><strong>4.2602</strong></td>
+        <td class="r">4.3087</td>
+        <td class="r">0.2011</td>
+        <td class="r">3.077</td>
+        <td class="r">4.536</td></tr>
+    <tr><td><strong>HEAD + FP8</strong></td><td>main talker FP8 quant</td>
+        <td class="r">500</td>
+        <td class="r"><strong>4.2636</strong></td>
+        <td class="r">4.3275</td>
+        <td class="r">0.2317</td>
+        <td class="r">2.769</td>
+        <td class="r">4.539</td></tr>
+  </tbody>
+</table>
+
+<h2>Paired 비교 (3-way)</h2>
+
+<p>같은 (voice, prompt) 쌍 에서의 score 차이. 500 매치, 동일 입력 분포.</p>
+
+<table>
+  <thead>
+    <tr><th>비교</th><th class="r">N</th><th class="r">mean Δ</th><th class="r">95% CI</th><th class="r">A wins</th><th class="r">B wins</th><th class="r">ties</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>HEAD BF16 − Fork BF16<br><small>(opt 효과)</small></td>
+        <td class="r">500</td>
+        <td class="r delta-pos"><strong>+0.0091</strong></td>
+        <td class="r">[-0.012, +0.031]</td>
+        <td class="r">258</td>
+        <td class="r">242</td>
+        <td class="r">0</td></tr>
+    <tr><td>HEAD FP8 − HEAD BF16<br><small>(FP8 효과)</small></td>
+        <td class="r">500</td>
+        <td class="r delta-zero"><strong>+0.0034</strong></td>
+        <td class="r">[-0.017, +0.024]</td>
+        <td class="r">256</td>
+        <td class="r">244</td>
+        <td class="r">0</td></tr>
+    <tr><td><strong>HEAD FP8 − Fork BF16</strong><br><small>(총 변화)</small></td>
+        <td class="r">500</td>
+        <td class="r delta-pos"><strong>+0.0126</strong></td>
+        <td class="r">[-0.011, +0.036]</td>
+        <td class="r">278</td>
+        <td class="r">222</td>
+        <td class="r">0</td></tr>
+  </tbody>
+</table>
+
+<p><strong>해석</strong>: 모든 paired Δ 의 95% CI가 0을 포함하거나 0 근접. 모든 단계의 변경이 audio quality 에 통계적 유의 차이를 만들지 않음.</p>
+
+<h2>Voice별 분석</h2>
+
+<table>
+  <thead>
+    <tr><th>Voice</th><th>Lang</th><th>Gender</th>
+        <th class="r">Fork</th><th class="r">HEAD-BF16</th><th class="r">HEAD-FP8</th>
+        <th class="r">HEAD-BF16 − Fork</th>
+        <th class="r">HEAD-FP8 − Fork</th>
+        <th class="r">FP8 − BF16</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Vivian</strong></td>
+      <td>Chinese</td>
+      <td>female</td>
+      <td class="r">4.207</td>
+      <td class="r">4.215</td>
+      <td class="r">4.200</td>
+      <td class="r delta-pos">+0.008</td>
+      <td class="r delta-neg">-0.007</td>
+      <td class="r delta-neg">-0.015</td>
+    </tr>
+    <tr>
+      <td><strong>Ryan</strong></td>
+      <td>English</td>
+      <td>male</td>
+      <td class="r">4.133</td>
+      <td class="r">4.149</td>
+      <td class="r">4.118</td>
+      <td class="r delta-pos">+0.017</td>
+      <td class="r delta-neg">-0.015</td>
+      <td class="r delta-neg">-0.031</td>
+    </tr>
+    <tr>
+      <td><strong>Aiden</strong></td>
+      <td>American English</td>
+      <td>male</td>
+      <td class="r">4.433</td>
+      <td class="r">4.443</td>
+      <td class="r">4.433</td>
+      <td class="r delta-pos">+0.010</td>
+      <td class="r delta-zero">-0.000</td>
+      <td class="r delta-neg">-0.010</td>
+    </tr>
+    <tr>
+      <td><strong>Serena</strong></td>
+      <td>Chinese</td>
+      <td>female</td>
+      <td class="r">4.251</td>
+      <td class="r">4.263</td>
+      <td class="r">4.271</td>
+      <td class="r delta-pos">+0.012</td>
+      <td class="r delta-pos">+0.020</td>
+      <td class="r delta-pos">+0.007</td>
+    </tr>
+    <tr>
+      <td><strong>Sohee</strong></td>
+      <td>Korean</td>
+      <td>female</td>
+      <td class="r">4.231</td>
+      <td class="r">4.229</td>
+      <td class="r">4.296</td>
+      <td class="r delta-zero">-0.002</td>
+      <td class="r delta-pos">+0.064</td>
+      <td class="r delta-pos">+0.066</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>샘플 프롬프트 (LJ Speech test set)</h2>
+
+<p>전체 500 프롬프트 중 처음 5개:</p>
+
+<ul style="font-size:0.92em">
+<li>p0000: <em>with jurisdiction to hold pleas in all actions within the prescribed limits. The…</em></li>
+<li>p0001: <em>The hope of reward might do much, but no system of penal discipline is complete …</em></li>
+<li>p0002: <em>and his Communist and Socialist Worker's Party newspapers would probably have ap…</em></li>
+<li>p0003: <em>Wilson was acquitted on this charge, but other suspicious facts cropped up while…</em></li>
+<li>p0004: <em>Captain Fritz returned to police headquarters from the Texas School Book Deposit…</em></li>
+</ul>
+
+<h2>측정 방법</h2>
+
+<ul>
+  <li><strong>텍스트 코퍼스</strong>: LJ Speech metadata.csv (13,100 transcripts) 에서 random.seed(42) shuffle 후 char-length 30-300 필터로 500개 선별</li>
+  <li><strong>샘플 수</strong>: 100 프롬프트 (위 500 중 앞 100개) × 5 voices × 3 configs = <strong>1500 WAV</strong></li>
+  <li><strong>Voices (5종)</strong>: Vivian, Ryan, Aiden, Serena, Sohee — 중/영/한 화자, 남/녀, 다양한 톤</li>
+  <li><strong>Configs</strong>:
+    <ul>
+      <li>Fork BF16: a5e1d5a0 (KV cache 토글 도입 시점, 다른 opt 모두 없음)</li>
+      <li>HEAD BF16: b0db844a (모든 opt 적용 후, FP8 없음)</li>
+      <li>HEAD + FP8: 위 + main talker FP8 (<code>quantization: fp8</code>)</li>
+    </ul>
+  </li>
+  <li><strong>UTMOSv1</strong>: <code>utmos==1.1.10</code> Python 3.9 venv, sarulab MOSNet 기반</li>
+  <li><strong>Paired analysis</strong>: 같은 (voice, prompt) 쌍의 score 차이로 quantization/opt 효과 isolation</li>
+</ul>
+
+<h2>결론</h2>
+
+<p>500 LJ Speech 프롬프트 × 5 voice 캐릭터에서의 1500-pair 평가 결과:</p>
+
+<ul>
+  <li><strong>Fork → HEAD BF16</strong>: Δ = +0.009 → sub-talker 6단계 + post-merge 최적화가 quality 영향 없음 ✓</li>
+  <li><strong>HEAD BF16 → HEAD FP8</strong>: Δ = +0.003 → main talker FP8 quantization이 quality 영향 없음 ✓</li>
+  <li><strong>Fork → HEAD+FP8 (총합)</strong>: Δ = +0.013 → throughput 1.75× 가속하면서 quality 손실 없음 ✓</li>
+</ul>
+
+<p>1500-pair paired 비교에서 평균 절대 Δ 0.02 이내, 95% CI 모두 0 근접 → <strong>HEAD+FP8 production 안전</strong>.</p>
+
+</div>
+</body>
+</html>

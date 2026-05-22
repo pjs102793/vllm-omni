@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Qwen3-TTS L40S 최적화 결과</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #1a1a1a;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --accent-bg: #eff6ff;
+    --success: #059669;
+    --success-bg: #ecfdf5;
+    --warn: #d97706;
+    --warn-bg: #fffbeb;
+    --danger: #dc2626;
+    --code-bg: #f3f4f6;
+    --code-fg: #1f2937;
+    --border: #e5e7eb;
+    --table-stripe: #fafbfc;
+    --table-hover: #f0f9ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Pretendard", "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+    line-height: 1.65;
+    color: var(--fg);
+    background: var(--bg);
+    margin: 0;
+    padding: 0;
+  }
+  .container { max-width: 1100px; margin: 0 auto; padding: 2.5rem 2rem; }
+  h1 { border-bottom: 3px solid var(--accent); padding-bottom: 0.5rem; color: var(--fg); font-size: 2rem; margin-top: 0; }
+  h2 { border-bottom: 1px solid var(--border); padding-bottom: 0.3rem; margin-top: 3rem; font-size: 1.5rem; color: var(--accent); }
+  h3 { margin-top: 2rem; font-size: 1.15rem; color: var(--fg); }
+  blockquote { border-left: 4px solid var(--accent); background: var(--accent-bg); margin: 1rem 0; padding: 0.75rem 1rem; color: var(--fg); border-radius: 0 4px 4px 0; }
+  blockquote p { margin: 0.3rem 0; }
+  code { background: var(--code-bg); color: var(--code-fg); padding: 0.15rem 0.35rem; border-radius: 3px; font-family: "SF Mono", Menlo, Monaco, Consolas, monospace; font-size: 0.92em; }
+  pre { background: var(--code-bg); color: var(--code-fg); padding: 1rem; border-radius: 6px; overflow-x: auto; line-height: 1.45; font-family: "SF Mono", Menlo, Monaco, Consolas, monospace; font-size: 0.88em; border: 1px solid var(--border); }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; background: white; box-shadow: 0 1px 2px rgba(0,0,0,0.04); border-radius: 6px; overflow: hidden; font-size: 0.92em; }
+  th { background: #f9fafb; text-align: left; padding: 0.55rem 0.7rem; font-weight: 600; font-size: 0.9em; border-bottom: 2px solid var(--border); }
+  td { padding: 0.45rem 0.7rem; border-bottom: 1px solid var(--border); }
+  tr:nth-child(even) td { background: var(--table-stripe); }
+  tr:hover td { background: var(--table-hover); }
+  td.r, th.r { text-align: right; font-variant-numeric: tabular-nums; }
+  td.c, th.c { text-align: center; }
+  .win { color: var(--success); font-weight: 600; }
+  .loss { color: var(--danger); font-weight: 600; }
+  .saturated { color: var(--muted); font-style: italic; }
+  .toc { background: white; border: 1px solid var(--border); border-radius: 6px; padding: 1rem 1.5rem; margin-bottom: 2rem; }
+  .toc h2 { border: none; margin-top: 0; padding: 0; font-size: 1rem; color: var(--muted); }
+  .toc ol { margin: 0.5rem 0; padding-left: 1.5rem; }
+  .toc li { margin: 0.15rem 0; font-size: 0.92em; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.75rem; margin: 1rem 0 2rem; }
+  .stat { background: white; border: 1px solid var(--border); border-radius: 6px; padding: 0.85rem 1rem; text-align: center; }
+  .stat .label { font-size: 0.8em; color: var(--muted); }
+  .stat .value { font-size: 1.4rem; font-weight: 700; color: var(--accent); margin: 0.2rem 0; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2.5rem 0; }
+  ul li { margin: 0.3rem 0; }
+  .summary-callout { background: linear-gradient(135deg, #eff6ff 0%, #ecfdf5 100%); border-left: 5px solid var(--accent); border-radius: 4px; padding: 1rem 1.5rem; margin: 1.5rem 0; }
+  .breakdown-bar { display: flex; height: 28px; border-radius: 4px; overflow: hidden; margin: 0.5rem 0 1rem; border: 1px solid var(--border); }
+  .breakdown-bar > div { display: flex; align-items: center; justify-content: center; color: white; font-size: 0.78em; font-weight: 600; text-shadow: 0 1px 1px rgba(0,0,0,0.3); }
+  .delta-pos { color: var(--success); font-weight: 600; }
+  .delta-zero { color: var(--muted); }
+  .delta-neg { color: var(--danger); }
+  .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 12px; font-size: 0.78em; font-weight: 600; vertical-align: middle; background: var(--accent-bg); color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>Qwen3-TTS L40S 최적화 결과</h1>
+
+<blockquote>
+환경: L40S (sm_89), bs=64 deploy, C2W skip — 모든 측정 <code>bench_qwen3_tts.py --repeats 7 --warmup 5 --bucket-warmup 3</code><br>
+<strong>측정 방법론</strong>: 8 단계 cumulative bench (Fork → 각 commit 적용 → 마지막에 KV cache 토글). 각 단계마다 별도 worktree에서 서버 재시작 + full bucket × bs sweep.
+</blockquote>
+
+<div class="summary-callout">
+  <strong>핵심 결과</strong> — Fork 시점 코드 대비 <span class="win">최대 1.75× throughput</span>.
+  bs=64 medium에서 <strong>857 → 1500 tok/s</strong>.
+  주요 기여: <strong>batched preprocess</strong>가 high batch의 절반, <strong>KV cache</strong>가 나머지 절반. 그 사이 <strong>FP8</strong>이 low/mid batch 를 잡아줌.
+</div>
+
+<div class="stat-grid">
+  <div class="stat"><div class="label">bs=1 (저배치)</div><div class="value">1.28×</div></div>
+  <div class="stat"><div class="label">bs=8 (중배치)</div><div class="value">1.31×</div></div>
+  <div class="stat"><div class="label">bs=32</div><div class="value">1.55×</div></div>
+  <div class="stat"><div class="label">bs=64 (최고)</div><div class="value">1.75×</div></div>
+</div>
+
+<div class="toc">
+  <h2>📑 목차</h2>
+  <ol>
+    <li><a href="#bottleneck">시작 — 어디가 병목이었나</a></li>
+    <li><a href="#cumulative">Cumulative speedup (8 단계 누적)</a></li>
+    <li><a href="#stages">각 단계별 기여 (B-F + H)</a></li>
+    <li><a href="#final">최종 비교 — Fork vs HEAD+KV</a></li>
+    <li><a href="#findings">핵심 발견</a></li>
+    <li><a href="#appendix-arch">부록 A — Sub-talker Architecture Sweep</a></li>
+    <li><a href="#appendix-method">부록 B — 측정 메소돌로지</a></li>
+  </ol>
+</div>
+
+<h2 id="bottleneck">시작 — 어디가 병목이었나</h2>
+
+<p>Fork 시점 (commit <code>a5e1d5a0</code>) 의 step time 분해 (bs=8 medium 기준):</p>
+
+<div class="breakdown-bar">
+  <div style="width: 38%; background: #2563eb;">Sub-talker AR (38%)</div>
+  <div style="width: 25%; background: #059669;">Main talker (25%)</div>
+  <div style="width: 20%; background: #d97706;">vLLM core (20%)</div>
+  <div style="width: 17%; background: #6b7280;">preprocess + sample (17%)</div>
+</div>
+
+<table>
+  <thead>
+    <tr><th>영역</th><th class="r">ms / step</th><th class="r">%</th><th>주요 작업</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Sub-talker AR loop</strong></td><td class="r">~8.5</td><td class="r">38%</td><td>5L × 14 sub-steps decoder + sample + codec_embed × 13</td></tr>
+    <tr><td>Main talker forward</td><td class="r">~5.3</td><td class="r">25%</td><td>28L × 2048H Qwen3 forward (1×)</td></tr>
+    <tr><td>vLLM core overhead</td><td class="r">~4.2</td><td class="r">20%</td><td>engine loop, RPC, _prepare_inputs</td></tr>
+    <tr><td>preprocess + sample</td><td class="r">~2.9</td><td class="r">17%</td><td>per-request loop, output post-process</td></tr>
+  </tbody>
+</table>
+
+<p><strong>병목은 sub-talker — step time의 38%</strong>. 14 sub-steps × 5 layers × 7 GEMMs = 490 GEMM call per main token. Sub-talker를 먼저 적극 최적화하고, 마지막에 main talker FP8 + KV cache 토글.</p>
+
+<hr>
+
+<h2 id="cumulative">Cumulative speedup (8 단계 누적)</h2>
+
+<p>각 stage 는 <strong>이전 stage 위에 누적된 누적 상태</strong>로 측정. 모든 측정은 동일 bench 도구 + 동일 워크로드.</p>
+
+<h3>medium bucket (대표 케이스)</h3>
+
+<table>
+  <thead>
+    <tr><th>Stage</th><th>Commit</th><th class="r">bs=1 RTF</th><th class="r">bs=8 RTF</th><th class="r">bs=32 RTF</th><th class="r">bs=64 RTF</th><th class="r">speedup<br>bs=64</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>A — Fork</strong> (baseline)</td><td><code>a5e1d5a0</code></td><td class="r">0.183</td><td class="r">0.034</td><td class="r">0.017</td><td class="r">0.014</td><td class="r">1.00×</td></tr>
+    <tr><td>B — + batched preprocess</td><td><code>7332dc87</code></td><td class="r">0.184</td><td class="r">0.033</td><td class="r">0.014</td><td class="r">0.010</td><td class="r win">1.40×</td></tr>
+    <tr><td>C — + flashinfer top-K</td><td><code>ae3053c8</code></td><td class="r">0.174</td><td class="r">0.031</td><td class="r">0.014</td><td class="r">0.010</td><td class="r win">1.40×</td></tr>
+    <tr><td>D — + QKV/Gate-Up fusion</td><td><code>e8f088b9</code></td><td class="r">0.164</td><td class="r">0.030</td><td class="r">0.014</td><td class="r">0.010</td><td class="r win">1.40×</td></tr>
+    <tr><td>E — + SDPA priority fix</td><td><code>e48390ea</code></td><td class="r">0.164</td><td class="r">0.030</td><td class="r">0.013</td><td class="r">0.010</td><td class="r win">1.40×</td></tr>
+    <tr><td>F — + main talker FP8</td><td><code>5a660d31</code></td><td class="r">0.144</td><td class="r">0.027</td><td class="r">0.013</td><td class="r">0.010</td><td class="r win">1.40×</td></tr>
+    <tr><td><strong>G — + KV cache ON</strong></td><td><code>env toggle</code></td><td class="r"><strong>0.143</strong></td><td class="r"><strong>0.026</strong></td><td class="r"><strong>0.011</strong></td><td class="r"><strong>0.008</strong></td><td class="r win"><strong>1.75×</strong></td></tr>
+  </tbody>
+</table>
+
+<h3>각 단계의 stage-별 marginal Δ% (medium bucket, lower = better)</h3>
+
+<table>
+  <thead>
+    <tr><th>Stage</th><th class="r">bs=1</th><th class="r">bs=4</th><th class="r">bs=8</th><th class="r">bs=16</th><th class="r">bs=32</th><th class="r">bs=64</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>B — preprocess</td><td class="r delta-zero">+0.5%</td><td class="r delta-zero">−1.6%</td><td class="r delta-pos">−2.9%</td><td class="r delta-pos">−4.5%</td><td class="r delta-pos"><strong>−17.6%</strong></td><td class="r delta-pos"><strong>−28.6%</strong></td></tr>
+    <tr><td>C — flashinfer</td><td class="r delta-pos">−5.4%</td><td class="r delta-pos">−5.0%</td><td class="r delta-pos">−6.1%</td><td class="r delta-pos">−9.5%</td><td class="r delta-zero">0%</td><td class="r delta-zero">0%</td></tr>
+    <tr><td>D — fusion</td><td class="r delta-pos">−5.7%</td><td class="r delta-pos">−5.3%</td><td class="r delta-pos">−3.2%</td><td class="r delta-zero">+5.3%</td><td class="r delta-zero">0%</td><td class="r delta-zero">0%</td></tr>
+    <tr><td>E — SDPA priority</td><td class="r delta-zero">0%</td><td class="r delta-zero">+1.9%</td><td class="r delta-zero">0%</td><td class="r delta-pos">−5.0%</td><td class="r delta-pos">−7.1%</td><td class="r delta-zero">0%</td></tr>
+    <tr><td>F — main FP8</td><td class="r delta-pos"><strong>−12.2%</strong></td><td class="r delta-pos"><strong>−12.7%</strong></td><td class="r delta-pos"><strong>−10.0%</strong></td><td class="r delta-pos">−5.3%</td><td class="r delta-zero">0%</td><td class="r delta-zero">0%</td></tr>
+    <tr><td><strong>G — KV cache ON</strong></td><td class="r delta-zero">−0.7%</td><td class="r delta-pos">−2.1%</td><td class="r delta-pos">−3.7%</td><td class="r delta-pos">−5.6%</td><td class="r delta-pos"><strong>−15.4%</strong></td><td class="r delta-pos"><strong>−20.0%</strong></td></tr>
+  </tbody>
+</table>
+
+<blockquote>
+<strong>핵심 패턴</strong>: <em>저 bs (1-4)</em> 는 main talker가 dominant → <strong>FP8가 가장 큰 win (−12%)</strong>.
+<em>고 bs (32-64)</em> 는 sub-talker AR과 per-request CPU work 가 dominant → <strong>batched preprocess (−28%) + KV cache (−20%) 가 압도적</strong>.
+중간 bs는 mixed.
+</blockquote>
+
+<hr>
+
+<h2 id="stages">각 단계별 기여 (자세히)</h2>
+
+<h3>B. Batched preprocess <code>7332dc87</code></h3>
+
+<p>매 step의 per-request preprocess Python loop (25.6 ms @ bs=64) 를 batched call로 융합 + inline merge.</p>
+
+<table>
+  <thead><tr><th>bucket</th><th class="r">bs</th><th class="r">이전</th><th class="r">이후</th><th class="r">Δ</th></tr></thead>
+  <tbody>
+    <tr><td>medium</td><td class="r">32</td><td class="r">0.017</td><td class="r">0.014</td><td class="r win">−17.6%</td></tr>
+    <tr><td>medium</td><td class="r">64</td><td class="r">0.014</td><td class="r"><strong>0.010</strong></td><td class="r win"><strong>−28.6%</strong></td></tr>
+    <tr><td>long</td><td class="r">32</td><td class="r">0.017</td><td class="r">0.014</td><td class="r win">−17.6%</td></tr>
+    <tr><td>long</td><td class="r">64</td><td class="r">0.014</td><td class="r"><strong>0.010</strong></td><td class="r win"><strong>−28.6%</strong></td></tr>
+    <tr><td>short</td><td class="r">64</td><td class="r">0.016</td><td class="r">0.013</td><td class="r win">−18.8%</td></tr>
+  </tbody>
+</table>
+
+<p>High batch (bs=32, 64) 에서 최대 효과. Preprocess 시간이 bs 에 비례 증가했으므로 batching 효과 극적. <strong>전체 누적 효과의 약 절반</strong> 차지.</p>
+
+<h3>C. flashinfer top-K sampling <code>ae3053c8</code></h3>
+
+<p>Sub-talker AR 의 매 sub-step sampling 을 <code>flashinfer.sampling.top_k_sampling_from_probs</code> 1-kernel로 교체.</p>
+
+<table>
+  <thead><tr><th>bucket</th><th class="r">bs</th><th class="r">이전</th><th class="r">이후</th><th class="r">Δ</th></tr></thead>
+  <tbody>
+    <tr><td>short</td><td class="r">1</td><td class="r">0.194</td><td class="r">0.185</td><td class="r win">−4.6%</td></tr>
+    <tr><td>short</td><td class="r">16</td><td class="r">0.023</td><td class="r">0.021</td><td class="r win">−8.7%</td></tr>
+    <tr><td>medium</td><td class="r">1</td><td class="r">0.184</td><td class="r">0.174</td><td class="r win">−5.4%</td></tr>
+    <tr><td>medium</td><td class="r">8</td><td class="r">0.033</td><td class="r">0.031</td><td class="r win">−6.1%</td></tr>
+    <tr><td>medium</td><td class="r">16</td><td class="r">0.021</td><td class="r">0.019</td><td class="r win">−9.5%</td></tr>
+  </tbody>
+</table>
+
+<p>Sampling 이 sub-talker time의 ~16% 비중이라 일관 5-10% 절감. bs=32, 64는 batched preprocess 이후 sub-talker saturation 으로 보이지 않음.</p>
+
+<h3>D. QKV + Gate/Up fusion <code>e8f088b9</code></h3>
+
+<p>Sub-talker의 별도 q/k/v Linear 3개 → <code>qkv_proj</code>, gate/up 2개 → <code>gate_up_proj</code>. bit-exact 검증 (max diff 0).</p>
+
+<table>
+  <thead><tr><th>bucket</th><th class="r">bs</th><th class="r">이전</th><th class="r">이후</th><th class="r">Δ</th></tr></thead>
+  <tbody>
+    <tr><td>medium</td><td class="r">1</td><td class="r">0.174</td><td class="r">0.164</td><td class="r win">−5.7%</td></tr>
+    <tr><td>medium</td><td class="r">4</td><td class="r">0.057</td><td class="r">0.054</td><td class="r win">−5.3%</td></tr>
+    <tr><td>long</td><td class="r">4</td><td class="r">0.056</td><td class="r">0.052</td><td class="r win">−7.1%</td></tr>
+    <tr><td>long</td><td class="r">2</td><td class="r">0.102</td><td class="r">0.093</td><td class="r win">−8.8%</td></tr>
+  </tbody>
+</table>
+
+<p>저-중 bs (1-4) 에서 일관 5-8% 절감. 고 bs (32-64) 효과 안 보임 — saturation.</p>
+
+<h3>E. SDPA priority fix <code>e48390ea</code></h3>
+
+<p>3중 gate 진단 (<code>enable_gqa=True</code> + <code>attn_mask</code>, MATH priority, vLLM cudnn_sdp disable) → <code>sdpa_kernel(list, set_priority=True)</code> + 수동 GQA expand.</p>
+
+<table>
+  <thead><tr><th>bucket</th><th class="r">bs</th><th class="r">이전</th><th class="r">이후</th><th class="r">Δ</th></tr></thead>
+  <tbody>
+    <tr><td>medium</td><td class="r">16</td><td class="r">0.020</td><td class="r">0.019</td><td class="r win">−5.0%</td></tr>
+    <tr><td>medium</td><td class="r">32</td><td class="r">0.014</td><td class="r">0.013</td><td class="r win">−7.1%</td></tr>
+    <tr><td>long</td><td class="r">16</td><td class="r">0.019</td><td class="r">0.020</td><td class="r delta-zero">+5.3% (noise)</td></tr>
+  </tbody>
+</table>
+
+<p>효과는 작음 (sub-talker 의 ~10%). 진단 가치가 훨씬 큼.</p>
+
+<h3>F. Main talker FP8 <code>5a660d31</code></h3>
+
+<p>vLLM의 <code>Fp8OnlineLinearMethod</code> 활성 — deploy yaml 1줄 추가 (<code>quantization: fp8</code>). Sub-talker (plain <code>nn.Linear</code>) 자동 제외.</p>
+
+<table>
+  <thead><tr><th>bucket</th><th class="r">bs</th><th class="r">이전</th><th class="r">이후</th><th class="r">Δ</th></tr></thead>
+  <tbody>
+    <tr><td>medium</td><td class="r">1</td><td class="r">0.164</td><td class="r">0.144</td><td class="r win"><strong>−12.2%</strong></td></tr>
+    <tr><td>medium</td><td class="r">4</td><td class="r">0.055</td><td class="r">0.048</td><td class="r win">−12.7%</td></tr>
+    <tr><td>medium</td><td class="r">8</td><td class="r">0.030</td><td class="r">0.027</td><td class="r win">−10.0%</td></tr>
+    <tr><td>medium</td><td class="r">16</td><td class="r">0.019</td><td class="r">0.018</td><td class="r win">−5.3%</td></tr>
+    <tr><td>medium</td><td class="r">32</td><td class="r">0.013</td><td class="r">0.013</td><td class="r delta-zero">0% (saturation)</td></tr>
+  </tbody>
+</table>
+
+<p><strong>저-중 bs (1-16) 의 dominant win</strong>. 고 bs 는 sub-talker AR 이 bottleneck 으로 이미 saturation 도달 — FP8 이 main talker 만 가속하니 효과 없음.</p>
+
+<h3>G. KV cache ON <code>QWEN3_TTS_USE_KV_CACHE=1</code></h3>
+
+<p>Sub-talker AR 의 매 sub-step 마다 전체 시퀀스 re-prefill → KV cache decode (seq=1). 14 sub-steps × 5 layers 의 FLOPs 17× 감소 (이론치).</p>
+
+<table>
+  <thead><tr><th>bucket</th><th class="r">bs</th><th class="r">이전</th><th class="r">이후</th><th class="r">Δ</th></tr></thead>
+  <tbody>
+    <tr><td>medium</td><td class="r">16</td><td class="r">0.018</td><td class="r">0.017</td><td class="r win">−5.6%</td></tr>
+    <tr><td>medium</td><td class="r">32</td><td class="r">0.013</td><td class="r"><strong>0.011</strong></td><td class="r win"><strong>−15.4%</strong></td></tr>
+    <tr><td>medium</td><td class="r">64</td><td class="r">0.010</td><td class="r"><strong>0.008</strong></td><td class="r win"><strong>−20.0%</strong></td></tr>
+    <tr><td>long</td><td class="r">32</td><td class="r">0.013</td><td class="r">0.011</td><td class="r win">−15.4%</td></tr>
+    <tr><td>long</td><td class="r">64</td><td class="r">0.010</td><td class="r"><strong>0.008</strong></td><td class="r win"><strong>−20.0%</strong></td></tr>
+    <tr><td>short</td><td class="r">32</td><td class="r">0.015</td><td class="r">0.013</td><td class="r win">−13.3%</td></tr>
+    <tr><td>short</td><td class="r">64</td><td class="r">0.012</td><td class="r">0.011</td><td class="r win">−8.3%</td></tr>
+  </tbody>
+</table>
+
+<p><strong>고 bs 에서 dominant win — batched preprocess 와 비슷한 크기</strong>. 사이즈가 큰 두 효과 가 누적되어 fork → HEAD+KV ON 의 1.40 → 1.75× 점프.</p>
+
+<hr>
+
+<h2 id="final">최종 정밀 비교 (Fork → HEAD+KV)</h2>
+
+<table>
+  <thead>
+    <tr><th>bucket</th><th class="r">bs</th><th class="r">Fork RTF</th><th class="r">HEAD+KV RTF</th><th class="r">speedup</th><th class="r">tok/s 변화</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>short</td><td class="r">1</td><td class="r">0.197</td><td class="r">0.153</td><td class="r win">1.29×</td><td class="r">61 → 78</td></tr>
+    <tr><td>short</td><td class="r">2</td><td class="r">0.118</td><td class="r">0.091</td><td class="r win">1.30×</td><td class="r">102 → 132</td></tr>
+    <tr><td>short</td><td class="r">4</td><td class="r">0.068</td><td class="r">0.054</td><td class="r win">1.26×</td><td class="r">176 → 222</td></tr>
+    <tr><td>short</td><td class="r">8</td><td class="r">0.038</td><td class="r">0.030</td><td class="r win">1.27×</td><td class="r">316 → 400</td></tr>
+    <tr><td>short</td><td class="r">16</td><td class="r">0.025</td><td class="r">0.019</td><td class="r win">1.32×</td><td class="r">480 → 632</td></tr>
+    <tr><td>short</td><td class="r">32</td><td class="r">0.019</td><td class="r">0.013</td><td class="r win">1.46×</td><td class="r">632 → 923</td></tr>
+    <tr><td>short</td><td class="r">64</td><td class="r">0.016</td><td class="r">0.011</td><td class="r win">1.45×</td><td class="r">750 → 1091</td></tr>
+    <tr><td>medium</td><td class="r">1</td><td class="r">0.183</td><td class="r">0.143</td><td class="r win">1.28×</td><td class="r">66 → 84</td></tr>
+    <tr><td>medium</td><td class="r">2</td><td class="r">0.105</td><td class="r">0.083</td><td class="r win">1.27×</td><td class="r">114 → 145</td></tr>
+    <tr><td>medium</td><td class="r">4</td><td class="r">0.061</td><td class="r">0.046</td><td class="r win">1.33×</td><td class="r">197 → 261</td></tr>
+    <tr><td>medium</td><td class="r">8</td><td class="r">0.034</td><td class="r">0.026</td><td class="r win">1.31×</td><td class="r">353 → 462</td></tr>
+    <tr><td>medium</td><td class="r">16</td><td class="r">0.022</td><td class="r">0.017</td><td class="r win">1.29×</td><td class="r">545 → 706</td></tr>
+    <tr><td>medium</td><td class="r">32</td><td class="r">0.017</td><td class="r">0.011</td><td class="r win">1.55×</td><td class="r">706 → 1091</td></tr>
+    <tr><td>medium</td><td class="r">64</td><td class="r">0.014</td><td class="r">0.008</td><td class="r win"><strong>1.75×</strong></td><td class="r"><strong>857 → 1500</strong></td></tr>
+    <tr><td>long</td><td class="r">1</td><td class="r">0.181</td><td class="r">0.141</td><td class="r win">1.28×</td><td class="r">66 → 85</td></tr>
+    <tr><td>long</td><td class="r">2</td><td class="r">0.105</td><td class="r">0.082</td><td class="r win">1.28×</td><td class="r">114 → 146</td></tr>
+    <tr><td>long</td><td class="r">4</td><td class="r">0.063</td><td class="r">0.045</td><td class="r win">1.40×</td><td class="r">190 → 267</td></tr>
+    <tr><td>long</td><td class="r">8</td><td class="r">0.033</td><td class="r">0.027</td><td class="r win">1.22×</td><td class="r">364 → 444</td></tr>
+    <tr><td>long</td><td class="r">16</td><td class="r">0.022</td><td class="r">0.017</td><td class="r win">1.29×</td><td class="r">545 → 706</td></tr>
+    <tr><td>long</td><td class="r">32</td><td class="r">0.017</td><td class="r">0.011</td><td class="r win">1.55×</td><td class="r">706 → 1091</td></tr>
+    <tr><td>long</td><td class="r">64</td><td class="r">0.014</td><td class="r">0.008</td><td class="r win"><strong>1.75×</strong></td><td class="r"><strong>857 → 1500</strong></td></tr>
+  </tbody>
+</table>
+
+<hr>
+
+<h2 id="findings">핵심 발견</h2>
+
+<h3>1. Bottleneck shifts as opts stack — 최적화 순서가 중요</h3>
+
+<p>Fork 상태에선 sub-talker AR이 dominant. Batched preprocess 가 그 위 CPU overhead 를 잡으면, sub-talker AR 의 GPU bound 가 새 bottleneck. Main talker FP8 는 그 와중에 main talker compute 를 줄여서 <strong>저 bs 의 위 효과를 누적</strong>. KV cache 는 sub-talker AR 자체 (5L × 14 sub-steps × re-prefill) 를 공격해서 <strong>고 bs 의 최종 큰 점프</strong>.</p>
+
+<h3>2. bs-별 dominant 기여자</h3>
+
+<table>
+  <thead><tr><th>bs 구간</th><th>Dominant 기여자</th><th>이유</th></tr></thead>
+  <tbody>
+    <tr><td><strong>bs=1-4</strong></td><td>F — Main talker FP8 (−12%)<br>C, D — flashinfer + fusion (-5%씩)</td><td>Main talker가 step time 의 큰 비중. sub-talker 작음.</td></tr>
+    <tr><td><strong>bs=8-16</strong></td><td>Mixed (F + C + D)</td><td>Main / sub-talker 비중 균형</td></tr>
+    <tr><td><strong>bs=32-64</strong></td><td>B — batched preprocess (−28%)<br>H — KV cache (−20%)</td><td>Per-request CPU overhead + sub-talker AR scaling 이 dominant</td></tr>
+  </tbody>
+</table>
+
+<h3>3. vLLM SDPA cuDNN dispatch 진단</h3>
+
+<p>3중 gate 발견:</p>
+<ol>
+  <li><code>enable_gqa=True</code> + <code>attn_mask</code> → fused backend 모두 거부</li>
+  <li>PyTorch priority order 에서 MATH가 CUDNN 앞</li>
+  <li>vLLM 전역 <code>enable_cudnn_sdp(False)</code> (diffusers 호환)</li>
+</ol>
+<p>해결: <code>sdpa_kernel(list, set_priority=True)</code> + 수동 GQA expand. SDPA backend time decode bs=8: MATH 30.3μs → <strong>CUDNN 11.5μs (−62%)</strong>.</p>
+
+<h3>4. PR 우선순위</h3>
+
+<table>
+  <thead><tr><th>Commit</th><th class="r">코드 변경 (LOC)</th><th class="r">측정 효과</th><th>PR-ability</th></tr></thead>
+  <tbody>
+    <tr><td><code>5a660d31</code> Main FP8 yaml</td><td class="r">67 (yaml only)</td><td class="r win">+10-15% (저-중 bs)</td><td><span class="badge">🟢 Tier 1</span> 즉시 가능</td></tr>
+    <tr><td><code>ae3053c8</code> flashinfer</td><td class="r">87</td><td class="r win">+5-10%</td><td><span class="badge">🟡 Tier 2</span></td></tr>
+    <tr><td><code>e48390ea</code> SDPA priority fix</td><td class="r">65</td><td class="r">+1-7% (진단 가치 큼)</td><td><span class="badge">🟡 Tier 2</span> (a5e1d5a0 의존)</td></tr>
+    <tr><td><code>e8f088b9</code> fusion</td><td class="r">254</td><td class="r win">+5-8% (저 bs)</td><td><span class="badge" style="background:#fffbeb;color:#d97706">🟠 Tier 3</span></td></tr>
+    <tr><td><code>7332dc87</code> batched preprocess</td><td class="r">327</td><td class="r win"><strong>+28% (high bs)</strong></td><td><span class="badge" style="background:#fffbeb;color:#d97706">🟠 Tier 3</span></td></tr>
+    <tr><td><code>a5e1d5a0</code> KV cache toggle</td><td class="r">619</td><td class="r win"><strong>+20% (high bs, when ON)</strong></td><td><span class="badge" style="background:#fffbeb;color:#d97706">🟠 Tier 3 (RFC)</span></td></tr>
+  </tbody>
+</table>
+
+<p><span class="badge" style="background:#f3f4f6;color:#6b7280">Removed</span> <code>42dee213</code> bulk copy + O(1) lookup — RTF 단위에서 측정 불가, 제거됨 (revert <code>b0db844a</code>).</p>
+
+<p><strong>가치 vs 코드량 비율</strong>: FP8 yaml 1줄로 10-15% (best ROI). KV cache 619줄로 20% (high bs). Batched preprocess 327줄로 28% (high bs). 진짜 큰 win 들은 모두 commit 사이즈도 큼.</p>
+
+<hr>
+
+<h2 id="appendix-arch">부록 A — Sub-talker Architecture Sweep</h2>
+
+<blockquote>
+실험: sub-talker를 wider+shallower (H=2048) 변형하면 L40S에서 더 빠른가?<br>
+측정: <code>QWEN3_TTS_SUBTALKER_LAYERS/HIDDEN/INTERMEDIATE</code> env로 config 오버라이드, random weights (audio 품질 무의미, profile only).
+</blockquote>
+
+<h3>bs=64 throughput (main tokens/sec)</h3>
+
+<table>
+  <thead><tr><th>Config</th><th class="r">short</th><th class="r">medium</th><th class="r">long</th></tr></thead>
+  <tbody>
+    <tr><td><strong>5L × 1024 × 3072</strong> (baseline) 🏆</td><td class="r"><strong>857</strong></td><td class="r"><strong>1333</strong></td><td class="r"><strong>1333</strong></td></tr>
+    <tr><td>3L × 2048 × 3072</td><td class="r loss">545</td><td class="r loss">632</td><td class="r loss">667</td></tr>
+    <tr><td>4L × 2048 × 3072</td><td class="r loss">571</td><td class="r loss">522</td><td class="r loss">600</td></tr>
+    <tr><td>5L × 2048 × 3072</td><td class="r loss">545</td><td class="r loss">545</td><td class="r loss">500</td></tr>
+  </tbody>
+</table>
+
+<p><strong>결론</strong>: H=2048 변형은 throughput 30-45% 손해. weight 2.6×↑가 BW-bound L40S에 그대로 반영. 현재 5L × 1024H 가 L40S에서 가장 효율적 architecture.</p>
+
+<hr>
+
+<h2 id="appendix-method">부록 B — 측정 메소돌로지</h2>
+
+<ul>
+  <li><strong>측정 도구</strong>: <code>bench_qwen3_tts.py</code> — httpx async 클라이언트로 <code>/v1/audio/speech</code> POST 스트리밍</li>
+  <li><strong>측정 조건</strong>: 모두 <code>--repeats 7 --warmup 5 --bucket-warmup 3 --batch-sizes 1,2,4,8,16,32,64</code></li>
+  <li><strong>모드</strong>: <code>QWEN3_TTS_SKIP_C2W=1</code> (audio decode 생략, sub-talker compute 비중 isolate)</li>
+  <li><strong>RTF_agg</strong>: <code>wall_total / sum(audio_durations)</code> — length-normalized, lower = faster</li>
+  <li><strong>Throughput</strong>: <code>12 / RTF_agg</code> (codec 12Hz → main tokens per second)</li>
+  <li><strong>Stage 별 측정</strong>: <code>git worktree</code> 로 각 commit 격리 후 server 재시작 + full sweep. 동일 야ml + 동일 워크로드 + 동일 GPU. 단 F 부터 FP8 yaml 사용, H 는 <code>QWEN3_TTS_USE_KV_CACHE=1</code> 환경변수.</li>
+  <li><strong>Hardware</strong>: L40S (sm_89, Ada Lovelace, 46GB VRAM, 864 GB/s memory BW)</li>
+  <li><strong>모델</strong>: <code>Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice</code>, voice <code>Vivian</code></li>
+  <li><strong>Buckets</strong>: short (~12 chars, ~2.4s audio) / medium (~45, ~9.6s) / long (~120, ~30s)</li>
+</ul>
+
+</div>
+</body>
+</html>
