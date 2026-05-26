@@ -749,8 +749,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             codec_streaming_flags.append(bool(cs_cached))
 
             tts_pad_embed = embed.get("tts_pad")
-            if not isinstance(tts_pad_embed, torch.Tensor):
-                raise RuntimeError("Missing `tts_pad_embed`; prefill must run first.")
 
             tail = hs.get("trailing_text")
             if isinstance(tail, torch.Tensor) and tail.ndim == 2 and tail.shape[0] > 0:
@@ -764,8 +762,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 new_tail_refs.append(tail if isinstance(tail, torch.Tensor) else None)
 
             last_hidden = hs.get("last")
-            if not isinstance(last_hidden, torch.Tensor):
-                raise RuntimeError("Missing hidden_states['last']; postprocess must run.")
             last_hidden_refs.append(last_hidden if last_hidden.ndim == 1 else last_hidden.reshape(-1))
 
         # 3) ONE batched stack each — single kernel launch per output tensor.

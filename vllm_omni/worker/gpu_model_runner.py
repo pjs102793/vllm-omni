@@ -1311,19 +1311,19 @@ class OmniGPUModelRunner(GPUModelRunner):
             # the dominant AR-loop case and benefits most from amortizing the
             # per-row Python loop into one batched call.
             # Opt-out via QWEN3_TTS_DISABLE_BATCH_PREPROCESS=1.
-            _bp_off = os.environ.get("QWEN3_TTS_DISABLE_BATCH_PREPROCESS", "0") == "1"
-            _num_reqs_bp = len(self.input_batch.req_ids)
-            _sched = scheduler_output.num_scheduled_tokens
+            batch_pp_off = os.environ.get("QWEN3_TTS_DISABLE_BATCH_PREPROCESS", "0") == "1"
+            num_decode_reqs = len(self.input_batch.req_ids)
+            num_sched_tokens = scheduler_output.num_scheduled_tokens
             all_decode = (
-                not _bp_off
+                not batch_pp_off
                 and self.has_talker_mtp
-                and _num_reqs_bp > 0
-                and all(int(_sched.get(rid, 0)) == 1 for rid in self.input_batch.req_ids[:_num_reqs_bp])
+                and num_decode_reqs > 0
+                and all(int(num_sched_tokens.get(rid, 0)) == 1 for rid in self.input_batch.req_ids[:num_decode_reqs])
                 and hasattr(self.model, "batch_preprocess_decode")
             )
 
             if all_decode:
-                N = _num_reqs_bp
+                N = num_decode_reqs
                 # Collect per-request info + GPU tensor references in one Python pass.
                 req_ids_list = list(self.input_batch.req_ids[:N])
                 req_infos_list: list[dict] = []
