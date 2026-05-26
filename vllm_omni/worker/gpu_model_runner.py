@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -1308,10 +1309,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             # --- Fast path: all-decode + model supports batched preprocess ----
             # Detect "all rows are decode (span_len=1) with talker_mtp"; this is
             # the dominant AR-loop case and benefits most from amortizing the
-            # per-row Python loop (~25ms on bs=64) into one batched call.
+            # per-row Python loop into one batched call.
             # Opt-out via QWEN3_TTS_DISABLE_BATCH_PREPROCESS=1.
-            import os as _osbp
-            _bp_off = _osbp.environ.get("QWEN3_TTS_DISABLE_BATCH_PREPROCESS", "0") == "1"
+            _bp_off = os.environ.get("QWEN3_TTS_DISABLE_BATCH_PREPROCESS", "0") == "1"
             _num_reqs_bp = len(self.input_batch.req_ids)
             _sched = scheduler_output.num_scheduled_tokens
             all_decode = (
@@ -1360,9 +1360,9 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 # Fast inline merge — skip _update_intermediate_buffer's
                 # per-row function call, gpu_keys check, and _store_value
-                # indirection (was ~88μs/row → 5.6ms on bs=64). Decode path
-                # only needs to update trailing_text + codec_streaming, both
-                # already in their final form (GPU tensor refs, cached bool).
+                # indirection. Decode path only needs to update trailing_text +
+                # codec_streaming, both already in their final form (GPU tensor
+                # refs, cached bool).
                 imb = self.model_intermediate_buffer
                 for req_id, upd in zip(req_ids_list, bp_out["info_updates"]):
                     existing = imb.get(req_id)

@@ -14,6 +14,7 @@ Shared by Qwen3-Omni and Qwen3-TTS talker models.
 from __future__ import annotations
 
 import dataclasses
+import os
 from collections.abc import Iterable
 
 import torch
@@ -616,12 +617,6 @@ class CodePredictorWrapper(nn.Module):
         """
         from vllm.platforms import current_platform
 
-        from vllm_omni.model_executor.models.common.qwen3_code_predictor_kv_graph import (
-            KVGraphState as _KVGraphState,
-        )
-
-        del _KVGraphState  # the type itself is unused here, just want a single import point
-
         # Determine bucket sizes the same way the re-prefill path does.
         max_bsz = self._vllm_config.scheduler_config.max_num_seqs
         bucket_sizes = [1 << i for i in range(max_bsz.bit_length()) if (1 << i) <= max_bsz]
@@ -731,8 +726,7 @@ class CodePredictorWrapper(nn.Module):
         get captured. Memory bandwidth reduction is the primary gain since
         sub-talker decode is BW-bound at typical batch sizes (1-32).
         """
-        import os as _osq
-        mode = _osq.environ.get("QWEN3_TTS_SUBTALKER_QUANT", "").lower()
+        mode = os.environ.get("QWEN3_TTS_SUBTALKER_QUANT", "").lower()
         if not mode:
             return
         try:
@@ -789,9 +783,7 @@ class CodePredictorWrapper(nn.Module):
             # for strict greedy equivalence experiments. Toggle to fp32 with
             # QWEN3_TTS_KV_CACHE_FP32=1 if a deployment needs deterministic-
             # equivalent output under greedy.
-            import os as _os
-
-            if _os.environ.get("QWEN3_TTS_KV_CACHE_FP32", "0") == "1":
+            if os.environ.get("QWEN3_TTS_KV_CACHE_FP32", "0") == "1":
                 self.model = self.model.float()
                 for i, lm in enumerate(self.lm_head):
                     self.lm_head[i] = lm.float()

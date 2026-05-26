@@ -688,7 +688,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         input_ids_batch: torch.Tensor,  # [N] long, one token per request
         req_infos_list: list[dict[str, Any]],  # length N, each is the per-req info dict
     ) -> dict[str, Any]:
-        """Batched decode-only fast path for preprocess (v2 — aggressive).
+        """Batched decode-only fast path for preprocess.
 
         Differs from a per-request loop in three places:
 
