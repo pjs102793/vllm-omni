@@ -46,6 +46,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._decode_left_context_frames = 25
         self._logged_codec_stats = False
 
+        # TODO(remove): 디버깅용 토글 — 추후 제거 예정 (debug-only, slated for removal).
         # Diagnostic: skip the codec→waveform decode and return zeros of the
         # correct length. Lets us measure main-talker + sub-talker throughput
         # without C2W cost. Toggle: QWEN3_TTS_SKIP_C2W=1

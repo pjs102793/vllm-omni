@@ -1311,6 +1311,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             # the dominant AR-loop case and benefits most from amortizing the
             # per-row Python loop into one batched call.
             # Opt-out via QWEN3_TTS_DISABLE_BATCH_PREPROCESS=1.
+            # TODO(remove): 디버깅용 kill-switch — fast path 안정화 후 제거 예정 (debug-only).
             batch_pp_off = os.environ.get("QWEN3_TTS_DISABLE_BATCH_PREPROCESS", "0") == "1"
             num_decode_reqs = len(self.input_batch.req_ids)
             num_sched_tokens = scheduler_output.num_scheduled_tokens
